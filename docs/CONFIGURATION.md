@@ -145,6 +145,19 @@ If you want to migrate only specific collections or rename collections during mi
 - **incrementalStreamPartitions**: Number of parallel sharded change stream readers at MongoDB source level (default: 1).
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines that apply change events to the target during incremental (live/live-only) replication (default: 32). These workers are I/O-bound — each spends most of its time waiting on a bulk write to the target — so this should be sized to hide target write latency, **not** to the CPU count. Against a multi-region Firestore target, per-batch bulk-write latency is ~150-200ms, so more concurrency directly raises apply throughput until the target saturates. Empirically (single-region → nam5): 8 workers cap apply at ~470 events/s, 48 workers reach ~1,800/s (sub-linear, since per-batch latency is fixed and grouped batches shrink). Rule of thumb: `workers ≈ peak_events_per_sec × bulk_write_latency_seconds ÷ avg_batch_size`. Raise this for high sustained single-collection write rates; the default 32 comfortably covers ~1,000 doc-changes/s. This is also the apply-side ceiling that determines whether live replication can keep up and thus your effective RPO — if steady-state apply throughput stays below the source's peak write rate, lag accumulates (it drains once source writes are frozen at cutover).
+
+  Sizing by workload — figures measured against a **multi-region** target (bulk-write p50 ~168ms). Aim for an apply ceiling of **≥ 1.5× your peak write rate** so lag stays near zero. Ordering is unaffected by this value (events route to a worker by document-ID hash, so per-document order is always preserved).
+
+  | Peak document changes/sec | Typical workload | Recommended `incrementalWorkerCount` | Approx. apply ceiling |
+  |---|---|---|---|
+  | **< 200/s** | Config store, low-frequency backend DB, small app | **8** | ~470/s |
+  | **~500/s** | Mid-size SaaS, order/transaction stream | **16** | ~850/s |
+  | **~1,000/s** | Production primary DB peak | **32** (default) | ~1,400/s |
+  | **~2,000/s** | High write volume, hot single collection | **48** | ~1,800/s |
+  | **~3,000/s** | Very high write volume | **64**, plus raise `incrementalWriteBatchSize` (256) and `targetMaxPoolSize` | ~2,200/s |
+  | **> 3,000/s** | Very large scale | Add workers, but the **target database** may become the bottleneck — benchmark first | measure |
+
+  Example: a DB peaking at ~800 changes/sec needs a ceiling ≥ 800 × 1.5 = 1,200/s → the 32-worker tier (~1,400/s), so set `incrementalWorkerCount: 32`. Caveats: a **single-region** target has much lower write latency, so the same throughput needs fewer workers (treat the table as conservative, roughly halve); and past a point the bottleneck shifts from tool concurrency to the target's write capacity, so always benchmark above ~2,000/s. Quick formula: `workers ≈ peak_write_rate ÷ 45`, rounded up with ~1.5× headroom.
 - **statsIntervalMinutes**: Interval for reporting change stream statistics in minutes (default: 5).
 - **groupOpsByDistinctId**: Enable key-collision grouping in live replication instead of optype-based grouping (default: false).
 - **flushIntervalMs**: Flush interval in milliseconds for operation groups (default: 500).
