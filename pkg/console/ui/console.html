@@ -181,7 +181,7 @@
   <div class="card">
     <h2><span class="step">1</span><span data-i18n="step1Title">源 Firestore（单区域）</span></h2>
     <label data-i18n="sourceConnLabel">源连接串</label>
-    <input type="text" id="source" value="mongodb://uid.asia-northeast1.firestore.goog:443/?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE">
+    <input type="text" id="source" placeholder="mongodb://&lt;uid&gt;.&lt;location&gt;.firestore.goog:443/&lt;databaseId&gt;?loadBalanced=true&amp;tls=true&amp;retryWrites=false&amp;authMechanism=MONGODB-OIDC&amp;authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE">
     <div style="margin-top:.75rem"><button id="detectBtn" onclick="detect()" data-i18n="detectBtn">检测源服务器</button>
       <span class="muted" id="detectHint" data-i18n-html="detectHint">&nbsp;检测版本 / 拓扑 / 复制方式，并列出库表</span></div>
     <div id="detectResult"></div>
@@ -252,7 +252,7 @@
       <div class="tunegrid">
         <label><span data-i18n="tInitWorkersLabel">全量写入 worker 数</span><input type="number" id="tInitWorkers" min="1" placeholder="默认 5" data-i18n-ph="tInitWorkersPh"></label>
         <label><span data-i18n="tConcCollLabel">并发集合数</span><input type="number" id="tConcColl" min="1" placeholder="默认 4" data-i18n-ph="tConcCollPh"></label>
-        <label><span data-i18n="tIncWorkersLabel">增量 worker 数</span><input type="number" id="tIncWorkers" min="1" placeholder="默认=CPU" data-i18n-ph="tIncWorkersPh"></label>
+        <label><span data-i18n="tIncWorkersLabel">增量 worker 数</span><input type="number" id="tIncWorkers" min="1" placeholder="默认 32" data-i18n-ph="tIncWorkersPh"></label>
         <label><span data-i18n="tMaxPartsLabel">最大读取分区数</span><input type="number" id="tMaxParts" min="1" placeholder="默认 8" data-i18n-ph="tMaxPartsPh"></label>
         <label><span data-i18n="tWorkersPerPartLabel">每分区 worker 数</span><input type="number" id="tWorkersPerPart" min="1" placeholder="默认 3" data-i18n-ph="tWorkersPerPartPh"></label>
         <label><span data-i18n="tMinDocsPerPartLabel">每分区最少文档数</span><input type="number" id="tMinDocsPerPart" min="1" placeholder="默认 10000" data-i18n-ph="tMinDocsPerPartPh"></label>
@@ -385,7 +385,7 @@ const I18N = {
     tConcCollLabel: `Concurrent collections`,
     tConcCollPh: `default 4`,
     tIncWorkersLabel: `Incremental workers`,
-    tIncWorkersPh: `default = CPU`,
+    tIncWorkersPh: `default 32`,
     tMaxPartsLabel: `Max read partitions`,
     tMaxPartsPh: `default 8`,
     tWorkersPerPartLabel: `Workers per partition`,
@@ -742,7 +742,7 @@ const I18N = {
     tConcCollLabel: `并发集合数`,
     tConcCollPh: `默认 4`,
     tIncWorkersLabel: `增量 worker 数`,
-    tIncWorkersPh: `默认=CPU`,
+    tIncWorkersPh: `默认 32`,
     tMaxPartsLabel: `最大读取分区数`,
     tMaxPartsPh: `默认 8`,
     tWorkersPerPartLabel: `每分区 worker 数`,
@@ -2179,17 +2179,23 @@ function connect(){
   if(!dlqPollTimer){ pollDlq(); dlqPollTimer = setInterval(pollDlq, 3000); }
 }
 
-// Remember the last-used source connection string across page loads. The
-// hardcoded value= on #source is only a first-run fallback; once the operator
-// switches sources, that choice must STICK on refresh — same "don't cling to the
-// old source" contract the remediation-plan fingerprint enforces server-side.
+// Remember the last-used source connection string across page loads, so an
+// operator re-running the tool doesn't have to retype it. The field is EMPTY by
+// default (only a placeholder hint shows the expected format) — we restore a
+// saved value only if it looks like a Firestore endpoint. A stale or foreign
+// string (e.g. a plain MongoDB URI left over from another tool) is dropped
+// rather than silently pre-filled, which would confuse the operator.
 // This script tag sits at the end of <body>, so the DOM is already parsed.
 (function initSourceMemory(){
   try {
     const inp = el("source");
     if(!inp) return;
     const saved = localStorage.getItem("srcConn");
-    if(saved) inp.value = saved;
+    if(saved && saved.includes(".firestore.goog")) {
+      inp.value = saved;
+    } else if(saved) {
+      localStorage.removeItem("srcConn"); // discard stale non-Firestore value
+    }
     inp.addEventListener("input", () => { try { localStorage.setItem("srcConn", inp.value); } catch(e){} });
   } catch(e){}
 })();
