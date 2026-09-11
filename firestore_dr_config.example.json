@@ -1,0 +1,59 @@
+{
+  "_comment": "多库 单区域 Firestore -> 多区域 Firestore(MongoDB 兼容) 容灾迁移示例。复制为 firestore_dr_config.json 后，把下面所有占位符替换成你自己的连接串。两端都是 Firestore，连接串都必须带 retryWrites=false。切勿把含真实凭据的文件提交进 git —— .gitignore 已忽略 firestore_dr_config.json。live 模式前须先在源库手动创建 change stream。",
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://<UID>.asia-northeast1.firestore.goog:443/<SOURCE_DB_ID_1>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<SOURCE_DB_ID_1>",
+        "replicationMethod": "changestream"
+      },
+      "target": {
+        "connectionString": "mongodb://<UID>.nam5.firestore.goog:443/<TARGET_DB_ID_1>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<TARGET_DB_ID_1>",
+        "syncAllIndexes": true
+      }
+    },
+    {
+      "source": {
+        "connectionString": "mongodb://<UID>.asia-northeast1.firestore.goog:443/<SOURCE_DB_ID_2>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<SOURCE_DB_ID_2>",
+        "replicationMethod": "changestream"
+      },
+      "target": {
+        "connectionString": "mongodb://<UID>.nam5.firestore.goog:443/<TARGET_DB_ID_2>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<TARGET_DB_ID_2>",
+        "syncAllIndexes": true
+      }
+    }
+  ],
+  "saveThreshold": 1000,
+  "checkpointInterval": 5,
+  "forceOrderedOperations": false,
+  "flushIntervalMs": 500,
+
+  "initialReadBatchSize": 8192,
+  "initialWriteBatchSize": 128,
+  "initialChannelBufferSize": 10,
+  "initialMigrationWorkers": 5,
+  "concurrentCollections": 4,
+
+  "incrementalReadBatchSize": 8192,
+  "incrementalWriteBatchSize": 128,
+  "incrementalWorkerCount": 8,
+  "statsIntervalMinutes": 5,
+
+  "parallelReadsEnabled": true,
+  "maxReadPartitions": 8,
+  "minDocsPerPartition": 10000,
+  "minDocsForParallelReads": 50000,
+  "sampleSize": 1000,
+  "workersPerPartition": 3,
+
+  "retryConfig": {
+    "maxRetries": 5,
+    "baseDelayMs": 100,
+    "maxDelayMs": 5000,
+    "enableBatchSplitting": true,
+    "minBatchSize": 10
+  }
+}

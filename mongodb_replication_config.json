@@ -1,0 +1,55 @@
+{
+  "_comment": "默认配置模板：单区域 Firestore -> 多区域 Firestore(MongoDB 兼容) 容灾迁移。把占位符替换成你自己的连接串（两端都必须带 retryWrites=false）。这是 -config 的默认路径；也可复制成自己的私有文件名再用 -config 指定。",
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://<UID>.asia-northeast1.firestore.goog:443/<SOURCE_DB_ID>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<SOURCE_DB_ID>",
+        "replicationMethod": "changestream"
+      },
+      "target": {
+        "connectionString": "mongodb://<UID>.nam5.firestore.goog:443/<TARGET_DB_ID>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<TARGET_DB_ID>",
+        "syncAllIndexes": true
+      }
+    }
+  ],
+  "saveThreshold": 1000,
+  "checkpointIntervalMinutes": 5,
+  "forceOrderedOperations": false,
+  "flushIntervalMs": 500,
+
+  "initialReadBatchSize": 8192,
+  "initialWriteBatchSize": 128,
+  "initialChannelBufferSize": 10,
+  "initialMigrationWorkers": 5,
+  "concurrentCollections": 4,
+
+  "incrementalReadBatchSize": 8192,
+  "incrementalWriteBatchSize": 128,
+  "incrementalWorkerCount": 8,
+  "statsIntervalMinutes": 5,
+
+  "parallelReadsEnabled": true,
+  "maxReadPartitions": 8,
+  "minDocsPerPartition": 10000,
+  "minDocsForParallelReads": 50000,
+  "sampleSize": 1000,
+  "workersPerPartition": 3,
+  "backfillRampUp": {
+    "enabled": true,
+    "startQps": 2000.0,
+    "rampRatePerMin": 10000.0,
+    "updateIntervalMs": 1000,
+    "useStaggeredWorkers": false,
+    "workerDelayMs": 0
+  },
+
+  "retryConfig": {
+    "maxRetries": 5,
+    "baseDelayMs": 100,
+    "maxDelayMs": 5000,
+    "enableBatchSplitting": true,
+    "minBatchSize": 10
+  }
+}

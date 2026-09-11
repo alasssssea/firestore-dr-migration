@@ -1,0 +1,55 @@
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://<uid>.asia-northeast1.firestore.goog:443/<sourceDbId>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<sourceDbId>",
+        "replicationMethod": "changestream"
+      },
+      "target": {
+        "connectionString": "mongodb://<uid>.nam5.firestore.goog:443/<targetDbId>?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE",
+        "database": "<targetDbId>",
+        "syncAllIndexes": true
+      }
+    }
+  ],
+  "saveThreshold": 1000,
+  "forceOrderedOperations": false,
+  "flushIntervalMs": 500,
+
+  "initialReadBatchSize": 8192,
+  "initialWriteBatchSize": 128,
+  "initialChannelBufferSize": 10,
+  "initialMigrationWorkers": 5,
+  "concurrentCollections": 4,
+
+  "incrementalReadBatchSize": 8192,
+  "incrementalWriteBatchSize": 128,
+  "incrementalWorkerCount": 8,
+  "statsIntervalMinutes": 5,
+
+  "parallelReadsEnabled": true,
+  "maxReadPartitions": 8,
+  "minDocsPerPartition": 10000,
+  "minDocsForParallelReads": 50000,
+  "sampleSize": 1000,
+  "workersPerPartition": 3,
+  "dropEmptyFieldNames": false,
+  "convertLongFieldNamesInNestedDocs": false,
+  "backfillRampUp": {
+    "enabled": true,
+    "startQps": 2000.0,
+    "rampRatePerMin": 10000.0,
+    "updateIntervalMs": 1000,
+    "useStaggeredWorkers": false,
+    "workerDelayMs": 0
+  },
+
+  "retryConfig": {
+    "maxRetries": 5,
+    "baseDelayMs": 100,
+    "maxDelayMs": 5000,
+    "enableBatchSplitting": true,
+    "minBatchSize": 10
+  }
+}

@@ -1,0 +1,2205 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firestore 容灾迁移控制台（单区域 → 多区域）</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0 auto; padding: 1.5rem; background: #0f1115; color: #e6e6e6; max-width: 1100px; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 0 0 .75rem; color: #cbd5e1; }
+  .sub { color: #8a92a6; font-size: .85rem; margin-bottom: 1.25rem; }
+  .card { background: #161a22; border: 1px solid #2a3142; border-radius: .6rem; padding: 1.1rem 1.25rem; margin-bottom: 1.1rem; }
+  .step { display: inline-block; width: 1.4rem; height: 1.4rem; line-height: 1.4rem; text-align: center; background: #2563eb; color: #fff; border-radius: 50%; font-size: .8rem; margin-right: .5rem; }
+  label { display: block; font-size: .8rem; color: #9aa3b5; margin: .6rem 0 .25rem; }
+  input[type=text], input[type=password], select { width: 100%; background: #0f1320; border: 1px solid #2a3142; color: #e6e6e6; border-radius: .4rem; padding: .5rem .6rem; font-size: .85rem; font-family: ui-monospace, monospace; }
+  input:focus, select:focus { outline: none; border-color: #3b82f6; }
+  button { background: #2563eb; color: #fff; border: none; border-radius: .4rem; padding: .55rem 1.1rem; font-size: .85rem; cursor: pointer; font-weight: 600; }
+  button:hover { background: #1d4ed8; }
+  button.secondary { background: #232838; border: 1px solid #2a3142; }
+  button.secondary:hover { background: #2a3142; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .muted { color: #8a92a6; font-size: .8rem; }
+  .pill { display: inline-block; padding: .15rem .5rem; border-radius: .3rem; font-size: .75rem; margin-right: .4rem; }
+  .pill-ok { background: #14321f; color: #4ade80; } .pill-warn { background: #3a2f14; color: #fbbf24; } .pill-info { background: #16263a; color: #60a5fa; }
+  .dbgroup { border: 1px solid #232838; border-radius: .4rem; padding: .6rem .75rem; margin-top: .6rem; }
+  .dbgroup summary { cursor: pointer; font-weight: 600; }
+  .colls { display: flex; flex-wrap: wrap; gap: .4rem .9rem; margin-top: .5rem; }
+  .colls label { display: flex; align-items: center; gap: .3rem; margin: 0; font-family: ui-monospace, monospace; color: #cbd5e1; }
+  .colls input, .authrow input { width: auto; }
+  .authrow { display: flex; gap: 1.2rem; align-items: center; margin-top: .3rem; flex-wrap: wrap; }
+  .authrow label { display: flex; align-items: center; gap: .3rem; margin: 0; color: #cbd5e1; }
+  .err { background: #3a1618; border: 1px solid #7f1d1d; color: #fca5a5; border-radius: .4rem; padding: .5rem .7rem; font-size: .82rem; margin-top: .6rem; white-space: pre-wrap; }
+  .ok { color: #4ade80; }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; margin-top: .5rem; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #232838; vertical-align: top; }
+  th { color: #8a92a6; font-weight: 500; }
+  .bar { background: #232838; border-radius: .3rem; height: .6rem; overflow: hidden; min-width: 120px; }
+  .bar > span { display: block; height: 100%; background: linear-gradient(90deg,#3b82f6,#22d3ee); }
+  /* Indeterminate bar: a shuttle for streams whose total is unknown. */
+  .bar.indet > span { width: 35%; background: linear-gradient(90deg,#3b82f6,#22d3ee); animation: indet 1.2s ease-in-out infinite; }
+  @keyframes indet { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+  .ph { display: inline-block; white-space: nowrap; font-size: .75rem; padding: .1rem .45rem; border-radius: .8rem; font-weight: 600; }
+  .ph-init { background: #1e3a5f; color: #7dd3fc; }
+  .ph-live { background: #14532d; color: #86efac; }
+  .ph-error { background: #3a1618; color: #fca5a5; }
+  .ph-stopped { background: #2a2f3c; color: #9aa3b5; }
+  /* A static (non-animated) bar used for live rows once the job is no longer
+     actively streaming — so a stopped/paused/done job stops "flashing". */
+  .bar.frozen > span { width: 100%; background: linear-gradient(90deg,#3a4152,#4a5266); }
+  .errcell { color: #fca5a5; white-space: pre-wrap; }
+  .jobs { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .75rem; }
+  .job { background: #1a1f2b; border: 1px solid #2a3142; border-radius: .5rem; padding: .5rem .75rem; font-size: .8rem; }
+  .state { font-weight: 600; }
+  .state-done { color: #4ade80; } .state-failed { color: #f87171; }
+  .state-live, .state-initial-load { color: #60a5fa; } .state-paused { color: #fbbf24; }
+  code { color: #93c5fd; font-family: ui-monospace, monospace; }
+  .hidden { display: none !important; }
+  .subtbl { margin: .2rem 0; width: 100%; font-size: .8rem; background: #0f1320; border-radius: .4rem; }
+  .subtbl th, .subtbl td { padding: .25rem .5rem; }
+  .subtbl code, .clip code { color: #93c5fd; }
+  /* Findings table: keep header labels on one line and stop long field
+     paths / values from blowing the layout out. */
+  .findtbl { table-layout: fixed; }
+  .findtbl th { white-space: nowrap; }
+  .findtbl td { vertical-align: top; }
+  .clip { overflow-wrap: anywhere; word-break: break-word; }
+  .clip.mono { font-family: ui-monospace, monospace; color: #cbd5e1; font-size: .78rem; }
+  .fixnote { color: #8a92a6; font-size: .76rem; margin-bottom: .35rem; line-height: 1.35; }
+  .smplink { color: #60a5fa; cursor: pointer; white-space: nowrap; margin-left: .3rem; }
+  .cnt { color: #cbd5e1; }
+  .btn-fix { padding: .28rem .7rem; }
+  .pendbar { margin: .7rem 0 .2rem; padding: .6rem .8rem; background: #14263a; border: 1px solid #1d4ed8;
+             border-radius: .5rem; font-size: .82rem; color: #cbd5e1; display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .pendbar .grow { flex: 1; min-width: 240px; }
+  .queued { color: #4ade80; font-size: .78rem; font-weight: 600; }
+  .autofix { color: #86efac; font-size: .78rem; }
+  .modewarn { margin-top: .7rem; padding: .6rem .8rem; border-radius: 6px; background: #3a2f14; border: 1px solid #6b5316; color: #fbbf24; font-size: .82rem; line-height: 1.5; }
+  .modewarn.hidden { display: none; }
+  .idxrow { margin-top: .8rem; }
+  .queued.warn { color: #fbbf24; }
+  .controls button { padding: .2rem .55rem; margin-right: .25rem; }
+  /* Control buttons reflect the job's current state: the button matching the
+     live state is highlighted (filled), and buttons that can't apply are dimmed. */
+  .controls button.on-pause  { background: #b45309; border-color: #b45309; color: #fff; }
+  .controls button.on-resume { background: #15803d; border-color: #15803d; color: #fff; }
+  .controls button.on-stop   { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+  .jobstate { font-size: .78rem; margin-left: .5rem; }
+  /* progress tabs + pager */
+  .tabs { display: flex; gap: .4rem; margin: .6rem 0 .4rem; }
+  .tab { background: #1a1f2e; color: #9aa3b2; border: 1px solid #232838; border-radius: 6px 6px 0 0;
+         padding: .4rem .8rem; cursor: pointer; font-size: .9rem; }
+  .tab.active { background: #232838; color: #e5e9f0; border-bottom-color: #232838; font-weight: 600; }
+  .tabcnt { display: inline-block; min-width: 1.2rem; padding: 0 .35rem; margin-left: .3rem;
+            background: #0f1420; border-radius: 999px; font-size: .78rem; color: #93c5fd; }
+  .pager { display: flex; align-items: center; gap: .8rem; margin-top: .6rem; }
+  .pager button[disabled] { opacity: .4; cursor: not-allowed; }
+  /* mapping combobox */
+  .maptbl td { padding: .55rem .6rem; }
+  .arrow { color: #60a5fa; font-weight: 700; text-align: center; }
+  .combo { position: relative; }
+  .dropdown { position: absolute; z-index: 30; left: 0; right: 0; top: 2.4rem; background: #0f1320; border: 1px solid #2a3142; border-radius: .4rem; max-height: 260px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  .ditem { padding: .45rem .6rem; cursor: pointer; font-size: .82rem; border-bottom: 1px solid #1c2230; }
+  .ditem:hover { background: #1a2233; }
+  .ditem .tag { font-size: .7rem; color: #8a92a6; margin-left: .4rem; }
+  .ditem.create { color: #4ade80; }
+  .ditem.disabled { color: #6b7280; cursor: not-allowed; }
+  .mapStatus { font-size: .75rem; margin-top: .3rem; }
+  .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center; }
+  .modal-card { background: #141824; border: 1px solid #2a3142; border-radius: .6rem; padding: 1.2rem 1.4rem; width: min(440px, 92vw); box-shadow: 0 12px 40px rgba(0,0,0,.6); }
+  .modal-card h3 { margin: 0 0 .8rem; }
+  .fld { display: block; margin: .7rem 0; font-size: .82rem; color: #c3cad9; }
+  .fld.chk { display: flex; align-items: center; gap: .4rem; }
+  .fld select { display: block; width: 100%; margin-top: .3rem; padding: .4rem; background: #0f1320; color: #e6e9f0; border: 1px solid #2a3142; border-radius: .4rem; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: .6rem; margin-top: 1rem; }
+  /* tuning grid */
+  .tunegrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .5rem .9rem; margin-top: .7rem; }
+  .tunegrid label { font-size: .78rem; color: #9aa3b5; margin: 0; }
+  .tunegrid input[type=number] { width: 100%; background: #0f1320; border: 1px solid #2a3142; color: #e6e6e6; border-radius: .4rem; padding: .45rem .55rem; font-size: .85rem; font-family: ui-monospace, monospace; margin-top: .25rem; }
+  .tunegrid label.chk { display: flex; align-items: center; gap: .4rem; align-self: end; color: #cbd5e1; }
+  .tunegrid label.chk input { width: auto; margin: 0; }
+  /* severity badges for assessment findings */
+  .sev { display: inline-block; white-space: nowrap; font-size: .72rem; padding: .1rem .45rem; border-radius: .3rem; font-weight: 700; }
+  .sev-B { background: #3a1618; color: #fca5a5; } .sev-A { background: #16263a; color: #60a5fa; } .sev-C { background: #3a2f14; color: #fbbf24; }
+  .ratio { margin: .3rem 0 0; padding-left: 1.1rem; }
+  .ratio li { font-size: .8rem; color: #9aa3b5; margin: .15rem 0; }
+  /* straggler (巨表长尾) per-collection override editor */
+  .straggler { margin-top: .8rem; border: 1px solid #4d3b1a; background: #1c1710; border-radius: .5rem; padding: .7rem .8rem; }
+  .straggler-h { font-weight: 600; color: #fcd34d; margin-bottom: .2rem; }
+  .straggler-row { border-top: 1px solid #2a2416; padding: .5rem 0 .2rem; }
+  .straggler-row:first-of-type { border-top: none; }
+  .straggler-name { font-size: .85rem; color: #e6e6e6; }
+  /* cutover readiness + DLQ (增量切换就绪 / 死信队列) */
+  .cutover-card { display: flex; align-items: flex-start; gap: .8rem; border-radius: .5rem; padding: .7rem .9rem; margin: .6rem 0 .2rem; border: 1px solid #2a3142; background: #12161f; }
+  .cutover-card .cut-light { font-size: 1.6rem; line-height: 1.6rem; }
+  .cutover-card .cut-body { flex: 1; }
+  .cutover-card .cut-body b { font-size: .92rem; }
+  .cutover-card.green  { border-color: #14532d; background: #0f2418; }
+  .cutover-card.amber  { border-color: #6b5316; background: #241d0f; }
+  .cutover-card.red    { border-color: #7f1d1d; background: #241012; }
+  .cutover-card.neutral { border-color: #2a3142; background: #12161f; }
+  .cut-steps { margin: .35rem 0 0; font-size: .78rem; color: #9aa3b5; line-height: 1.5; }
+  .dlq-banner { background: #3a1618; border: 1px solid #7f1d1d; color: #fca5a5; border-radius: .4rem; padding: .55rem .8rem; font-size: .85rem; margin: .6rem 0 .2rem; display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .dlq-banner button { padding: .3rem .7rem; }
+  .reset-bar { display: flex; align-items: center; gap: .6rem; margin: .5rem 0 .2rem; flex-wrap: wrap; }
+  .reset-bar button.danger { background: #7c2d12; border: 1px solid #9a3412; }
+  .reset-bar button.danger:hover { background: #9a3412; }
+  .reset-bar button[disabled] { opacity: .4; cursor: not-allowed; }
+  .dlq-panel { margin-top: .8rem; border-top: 1px solid #232838; padding-top: .7rem; }
+  .dlq-panel h3 { font-size: .9rem; margin: 0 0 .5rem; color: #fca5a5; }
+  .dlq-retry { margin: 0 0 .7rem; padding: .5rem .6rem; background: #12161f; border: 1px solid #2a3142; border-radius: .4rem; font-size: .85rem; line-height: 1.5; color: #cbd5e1; }
+  .dlq-grp { margin-bottom: .5rem; background: #12161f; border: 1px solid #2a3142; border-radius: .4rem; padding: .4rem .6rem; }
+  .dlq-grp summary { cursor: pointer; font-size: .85rem; }
+  .dlqtbl { width: 100%; font-size: .78rem; margin-top: .4rem; }
+  .dlqtbl th { text-align: left; }
+  .dlq-row { cursor: pointer; }
+  .dlq-row:hover { background: #1a2233; }
+  .dlq-err { color: #fca5a5; max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+  .dlq-doc pre { background: #0f1320; border-radius: .4rem; padding: .5rem .6rem; font-size: .75rem; overflow-x: auto; margin: .2rem 0; color: #cbd5e1; }
+  .bad { color: #f87171; font-weight: 600; }
+  .rdy { white-space: nowrap; font-size: .78rem; }
+  .stream-dot { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; background: #22d3ee; margin-right: .35rem; animation: pulse 1.2s ease-in-out infinite; vertical-align: middle; }
+  @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+  /* Top-right language toggle */
+  #langToggle { position: fixed; top: .8rem; right: 1rem; z-index: 200; display: flex; gap: .25rem; }
+  #langToggle button { background: #232838; border: 1px solid #2a3142; color: #cbd5e1; padding: .3rem .6rem; font-size: .78rem; font-weight: 600; border-radius: .4rem; cursor: pointer; }
+  #langToggle button:hover { background: #2a3142; }
+  #langToggle button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+</style>
+</head>
+<body>
+  <div id="langToggle">
+    <button type="button" data-lang="en" onclick="setLang('en')">EN</button>
+    <button type="button" data-lang="zh" onclick="setLang('zh')">中文</button>
+  </div>
+  <h1 data-i18n="appTitle">Firestore 容灾迁移控制台 (单区域 → 多区域)</h1>
+  <div class="sub" data-i18n="subtitle">网页里配置并发起迁移：检测源 → 勾选库表 → 把每个源库映射到一个多区域 Firestore 目标库 → 选模式 → 开始，本页实时看进度。</div>
+
+  <!-- Step 1: source -->
+  <div class="card">
+    <h2><span class="step">1</span><span data-i18n="step1Title">源 Firestore（单区域）</span></h2>
+    <label data-i18n="sourceConnLabel">源连接串</label>
+    <input type="text" id="source" value="mongodb://uid.asia-northeast1.firestore.goog:443/?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:gcp,TOKEN_RESOURCE:FIRESTORE">
+    <div style="margin-top:.75rem"><button id="detectBtn" onclick="detect()" data-i18n="detectBtn">检测源服务器</button>
+      <span class="muted" id="detectHint" data-i18n-html="detectHint">&nbsp;检测版本 / 拓扑 / 复制方式，并列出库表</span></div>
+    <div id="detectResult"></div>
+    <div id="detectErr"></div>
+  </div>
+
+  <!-- Step 2: databases/collections -->
+  <div class="card hidden" id="selCard">
+    <h2><span class="step">2</span><span data-i18n="step2Title">选择要迁移的库 / 集合</span></h2>
+    <div id="dbList"></div>
+  </div>
+
+  <!-- Step 3: source→firestore mapping -->
+  <div class="card hidden" id="targetCard">
+    <h2><span class="step">3</span><span data-i18n="step3Title">源库 → Firestore 目标映射</span></h2>
+    <div class="muted" data-i18n="step3Desc">每个源 Firestore 库对应一个多区域 Firestore 目标库，各自独立 endpoint。为每个已勾选的源库指定一个目标：可选已有库（可搜索），或输入新名字点「新建」。目标必须是已建好的空多区域库。</div>
+    <div style="margin:.6rem 0"><button class="secondary" onclick="loadFirestore()" data-i18n="refreshFsBtn">刷新 Firestore 库列表</button>
+      <span id="fireHint" class="muted"></span></div>
+    <table class="maptbl"><thead><tr><th style="width:34%" data-i18n="thSourceDb">源库</th><th style="width:5%"></th><th data-i18n="thFsTarget">Firestore 目标库</th></tr></thead>
+      <tbody id="mapRows"></tbody></table>
+    <div class="muted" id="mapEmpty" data-i18n="mapEmpty">（先在上一步勾选源库/集合，这里会自动生成映射行）</div>
+
+    <label style="margin-top:1rem" data-i18n="authLabel">认证方式（对所有目标库生效）</label>
+    <div class="authrow">
+      <label><input type="radio" name="auth" value="oidc" checked onchange="toggleAuth()"> <span data-i18n="authOidc">服务账号 OIDC（免密码，长跑推荐）</span></label>
+      <label><input type="radio" name="auth" value="scram" onchange="toggleAuth()"> <span data-i18n="authScram">SCRAM 用户名/密码</span></label>
+    </div>
+    <div class="authrow hidden" id="scramFields">
+      <div style="flex:1"><label data-i18n="scramUser">用户名</label><input type="text" id="scramUser"></div>
+      <div style="flex:1"><label data-i18n="scramPass">密码</label><input type="password" id="scramPass"></div>
+    </div>
+  </div>
+
+  <!-- Step 4: pre-migration assessment (optional) -->
+  <div class="card hidden" id="assessCard">
+    <h2><span class="step">4</span><span data-i18n="step4Title">预迁移评估（可选，但推荐）</span></h2>
+    <div class="muted" data-i18n="step4Desc">抽样扫描已勾选的源库/集合，检查 Firestore 兼容性风险（文档大小、字段名、嵌套深度、索引预算…），并据数据量与本机 CPU 推荐并发配置。</div>
+    <details style="margin:.6rem 0" id="sampleDetails">
+      <summary style="cursor:pointer"><span data-i18n="sampleSummary">抽样设置</span> <span class="muted" data-i18n="sampleSummaryHint">（越大越准，越慢越贵；留空=默认）</span></summary>
+      <div class="tunegrid">
+        <label><span data-i18n="sFloorLabel">每集合最少抽样</span><input type="number" id="sFloor" min="1" placeholder="默认 1000" data-i18n-ph="sFloorPh"></label>
+        <label><span data-i18n="sRateLabel">按比例抽样 %</span><input type="number" id="sRate" min="0" step="0.01" placeholder="默认 0.1" data-i18n-ph="sRatePh"></label>
+        <label><span data-i18n="sCapLabel">每集合抽样上限</span><input type="number" id="sCap" min="1" placeholder="默认 50000" data-i18n-ph="sCapPh"></label>
+      </div>
+      <div class="muted" style="margin-top:.3rem" data-i18n-html="sampleFormula">每个集合抽 <code>clamp(最少, 上限, max(最少, 总数×比例))</code> 条。大表按比例保证覆盖率，上限控成本。旧逻辑是每集合固定 1000，百万级大表抽样率不足 0.1%，易漏稀疏脏数据。</div>
+    </details>
+    <div style="margin:.7rem 0"><button class="secondary" id="assessBtn" onclick="runAssess()" data-i18n="assessBtn">运行评估</button>
+      <span class="muted" id="assessHint"></span></div>
+    <div id="assessResult"></div>
+  </div>
+
+  <!-- Step 5: mode + start -->
+  <div class="card hidden" id="modeCard">
+    <h2><span class="step">5</span><span data-i18n="step5Title">模式、并发配置并开始</span></h2>
+    <div class="authrow">
+      <label><input type="radio" name="mode" value="migrate" checked onchange="onModeChange()"> <span data-i18n="modeMigrate">全量迁移 (migrate)</span></label>
+      <label><input type="radio" name="mode" value="live" onchange="onModeChange()"> <span data-i18n="modeLive">全量 + 增量追尾 (live)</span></label>
+    </div>
+    <div id="modeWarn" class="modewarn" data-i18n-html="modeWarn">⚠️ <b>全量迁移是一次性拷贝，不追增量。</b>迁移期间源库若仍有写入，这些写入<b>不会</b>被迁移，且不会报错。需要完整同步（含迁移期间的变更）请选「全量 + 增量追尾 (live)」。仅在源库已停写 / 只要快照时用它。<span class="muted">（live 模式需先在源 Firestore 上手动创建 change stream，见文档。）</span></div>
+
+    <div class="idxrow">
+      <label class="chk"><input type="checkbox" id="syncSecIdx" checked> <span data-i18n="syncSecIdxLabel">复制源库二级索引到目标（默认开）</span></label>
+      <div class="muted" style="margin-top:.3rem" data-i18n-html="syncSecIdxHint"><code>_id</code> 索引始终会建（Firestore 刚需，无法关闭）。关掉此项则<b>只建 <code>_id</code></b>，源库的二级索引不复制——你可在迁移完成后自行在 Firestore 端按需创建。</div>
+    </div>
+
+    <details style="margin-top:.9rem" id="tuneDetails">
+      <summary style="cursor:pointer"><span data-i18n="tuneSummary">高级：线程 / 并发配置</span> <span class="muted" id="tuneSrc"></span></summary>
+      <div class="tunegrid">
+        <label><span data-i18n="tInitWorkersLabel">全量写入 worker 数</span><input type="number" id="tInitWorkers" min="1" placeholder="默认 5" data-i18n-ph="tInitWorkersPh"></label>
+        <label><span data-i18n="tConcCollLabel">并发集合数</span><input type="number" id="tConcColl" min="1" placeholder="默认 4" data-i18n-ph="tConcCollPh"></label>
+        <label><span data-i18n="tIncWorkersLabel">增量 worker 数</span><input type="number" id="tIncWorkers" min="1" placeholder="默认=CPU" data-i18n-ph="tIncWorkersPh"></label>
+        <label><span data-i18n="tMaxPartsLabel">最大读取分区数</span><input type="number" id="tMaxParts" min="1" placeholder="默认 8" data-i18n-ph="tMaxPartsPh"></label>
+        <label><span data-i18n="tWorkersPerPartLabel">每分区 worker 数</span><input type="number" id="tWorkersPerPart" min="1" placeholder="默认 3" data-i18n-ph="tWorkersPerPartPh"></label>
+        <label><span data-i18n="tMinDocsPerPartLabel">每分区最少文档数</span><input type="number" id="tMinDocsPerPart" min="1" placeholder="默认 10000" data-i18n-ph="tMinDocsPerPartPh"></label>
+        <label><span data-i18n="tMinDocsParallelLabel">并行读触发阈值·文档数</span><input type="number" id="tMinDocsParallel" min="1" placeholder="默认 50000" data-i18n-ph="tMinDocsParallelPh"></label>
+        <label class="chk"><input type="checkbox" id="tParallel"> <span data-i18n="tParallelLabel">启用大集合并行分区读取</span></label>
+      </div>
+      <div class="muted" style="margin-top:.3rem" data-i18n="tuneHint1">留空 = 使用引擎默认值。运行上方评估后会自动填入推荐值。</div>
+      <div class="muted" style="margin-top:.3rem" data-i18n-html="tuneHint2">巨表长尾（少数大表跑很久）：单表并行度 ≈ <b>最大读取分区数 × 每分区 worker 数</b>，与「并发集合数」无关。若某表<b>字节大但条数少</b>（不到「并行读触发阈值」），会退化成单游标顺序读而卡住——把<b>触发阈值</b>和<b>每分区最少文档数</b>调低即可让它也走分区并行。</div>
+    </details>
+
+    <div style="margin-top:.9rem">
+      <button id="startBtn" onclick="start()" data-i18n="startBtn">开始迁移</button>
+      <span class="muted" id="startHint"></span>
+    </div>
+    <div id="startErr"></div>
+  </div>
+
+  <!-- Progress -->
+  <div class="card hidden" id="progressCard">
+    <h2 data-i18n="progressTitle">实时进度</h2>
+    <div class="muted" id="status" data-i18n="statusConnecting">连接中…</div>
+    <div id="dlqBanner" class="dlq-banner hidden"></div>
+    <div id="cutoverCard" class="cutover-card neutral"><div class="cut-light">⚪</div><div class="cut-body"><b data-i18n="cutoverInitial">切换就绪：尚无增量数据</b></div></div>
+    <div class="reset-bar">
+      <button class="secondary danger" id="resetBtn" onclick="resetSession()" data-i18n="resetBtn">🧹 重置会话</button>
+      <span class="muted" data-i18n="resetHint">清空修复计划 + 移除已结束任务 + 删除上次运行残留文件（会先备份计划；不动连接配置与云端数据）。</span>
+    </div>
+    <div class="jobs" id="jobs"></div>
+    <!-- 运行中调速：静态区（不随 SSE tick 重建，输入不会被刷掉）。仅在有任务运行时显示。 -->
+    <div class="card hidden" id="speedPanel" style="margin-top:.6rem;padding:.7rem .8rem">
+      <div style="font-weight:600;margin-bottom:.4rem"><span data-i18n="speedTitle">⚡ 运行中调速</span>
+        <span class="muted" style="font-weight:400;font-size:.78rem" data-i18n-html="speedHint">（不重启任务、不清数据；对<b>尚未开始加载</b>的表生效——正在加载的表保持其启动时的配置）</span>
+      </div>
+      <div class="tunegrid">
+        <label><span data-i18n="rcConcLabel">同时迁移表数</span><br><input type="number" id="rcConc" min="1" max="64" placeholder="如 8" data-i18n-ph="rcConcPh"></label>
+        <label><span data-i18n="rcMaxPartsLabel">全局·分区数</span><br><input type="number" id="rcMaxParts" min="1" max="64" placeholder="如 16" data-i18n-ph="rcMaxPartsPh"></label>
+        <label><span data-i18n="rcWorkersLabel">全局·每区 worker</span><br><input type="number" id="rcWorkers" min="1" max="32" placeholder="如 5" data-i18n-ph="rcWorkersPh"></label>
+      </div>
+      <div style="margin-top:.5rem"><button class="secondary" onclick="applyReconfig(false)" data-i18n="applyGlobalBtn">应用全局调速</button></div>
+      <div style="margin-top:.7rem;border-top:1px solid #2a2416;padding-top:.55rem">
+        <div class="muted" style="font-size:.78rem;margin-bottom:.35rem" data-i18n-html="perCollHint">给某张<b>还没开始</b>的大表单独加码（可选，会自动为它开启并行分区读）：</div>
+        <div class="tunegrid">
+          <label><span data-i18n="rcDbLabel">库</span><br><input type="text" id="rcDb" placeholder="源库名" data-i18n-ph="rcDbPh"></label>
+          <label><span data-i18n="rcCollLabel">集合</span><br><input type="text" id="rcColl" placeholder="集合名" data-i18n-ph="rcCollPh"></label>
+          <label><span data-i18n="rcCMaxPartsLabel">分区数</span><br><input type="number" id="rcCMaxParts" min="1" max="64" placeholder="如 32" data-i18n-ph="rcCMaxPartsPh"></label>
+          <label><span data-i18n="rcCWorkersLabel">每区 worker</span><br><input type="number" id="rcCWorkers" min="1" max="32" placeholder="如 4" data-i18n-ph="rcCWorkersPh"></label>
+        </div>
+        <div style="margin-top:.5rem"><button class="secondary" onclick="applyReconfig(true)" data-i18n="applyPerCollBtn">应用到该表</button></div>
+      </div>
+      <div class="muted" id="rcMsg" style="margin-top:.45rem;font-size:.8rem"></div>
+    </div>
+    <div class="tabs" id="progTabs">
+      <button class="tab active" id="tabActive" onclick="setProgTab('active')"><span data-i18n="tabActive">进行中 / 待处理</span> <span id="cntActive" class="tabcnt">0</span></button>
+      <button class="tab" id="tabDone" onclick="setProgTab('done')"><span data-i18n="tabDone">已完成</span> <span id="cntDone" class="tabcnt">0</span></button>
+    </div>
+    <table>
+      <thead><tr><th data-i18n="thCollection">库.集合</th><th data-i18n="thPhase">阶段</th><th data-i18n="thProgress">进度</th><th>%</th><th data-i18n="thThroughput">吞吐</th><th>ETA</th><th>Lag</th><th data-i18n="thFailed">失败</th><th>DLQ</th><th data-i18n="thReady">就绪</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="pager" id="pager"></div>
+    <div id="dlqPanel" class="dlq-panel hidden"></div>
+
+    <div style="margin-top:1rem;border-top:1px solid #232838;padding-top:.8rem">
+      <b data-i18n="verifyTitle">迁移后校验</b> <span class="muted" data-i18n="verifyDesc">对每个源→目标集合比对文档计数（可选内容哈希）。全量完成后再点。</span>
+      <div style="margin-top:.5rem">
+        <button class="secondary" id="verifyBtn" onclick="runVerify()" data-i18n="verifyBtn">验证迁移结果</button>
+        <label style="display:inline-flex;align-items:center;gap:.3rem;margin:0 0 0 .6rem"><input type="checkbox" id="verifyHash" style="width:auto"> <span data-i18n="verifyHashLabel">同时比对内容哈希（慢）</span></label>
+      </div>
+      <div id="verifyResult"></div>
+    </div>
+  </div>
+
+  <div class="modal-bg hidden" id="modal">
+    <div class="modal-card">
+      <h3 data-i18n="modalTitle">新建 Firestore 库</h3>
+      <div id="cmBody"></div>
+      <div class="modal-actions">
+        <button class="secondary" onclick="closeModal()" data-i18n="cancelBtn">取消</button>
+        <button id="cmCreate" data-i18n="createBtn">创建</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ---------- i18n ---------- */
+const I18N = {
+  en: {
+    appTitle: `Firestore DR Migration Console (regional → multi-region)`,
+    subtitle: `Configure and launch a migration here: detect the source → select databases/collections → map each source DB to one multi-region Firestore target → choose a mode → start, and watch live progress on this page.`,
+    step1Title: `Source Firestore (regional)`,
+    sourceConnLabel: `Source connection string`,
+    detectBtn: `Detect source server`,
+    detectBtnBusy: `Detecting…`,
+    detectHint: `&nbsp;Detect version / topology / replication method, and list databases & collections`,
+    step2Title: `Select databases / collections to migrate`,
+    step3Title: `Source DB → Firestore target mapping`,
+    step3Desc: `Each source Firestore database maps to one multi-region Firestore target database, each with its own endpoint. Assign a target for every selected source DB: pick an existing database (searchable), or type a new name and click Create. The target must be a pre-created, empty multi-region database.`,
+    refreshFsBtn: `Refresh Firestore database list`,
+    thSourceDb: `Source DB`,
+    thFsTarget: `Firestore target DB`,
+    mapInputPh: `Search existing databases, or type a new name…`,
+    mapEmpty: `(Select source databases/collections in the previous step; mapping rows will be generated here automatically.)`,
+    authLabel: `Authentication (applies to all target databases)`,
+    authOidc: `Service-account OIDC (passwordless, recommended for long runs)`,
+    authScram: `SCRAM username / password`,
+    scramUser: `Username`,
+    scramPass: `Password`,
+    step4Title: `Pre-migration assessment (optional, recommended)`,
+    step4Desc: `Sample-scan the selected source databases/collections to check Firestore compatibility risks (document size, field names, nesting depth, index budget…), and recommend concurrency settings based on data volume and local CPU.`,
+    sampleSummary: `Sampling settings`,
+    sampleSummaryHint: `(larger = more accurate but slower and costlier; blank = default)`,
+    sFloorLabel: `Min samples per collection`,
+    sFloorPh: `default 1000`,
+    sRateLabel: `Proportional sampling %`,
+    sRatePh: `default 0.1`,
+    sCapLabel: `Max samples per collection`,
+    sCapPh: `default 50000`,
+    sampleFormula: `Each collection samples <code>clamp(floor, cap, max(floor, total × rate))</code> documents. Large tables use the rate to guarantee coverage while the cap controls cost. The old logic sampled a fixed 1000 per collection, giving million-row tables a sampling rate below 0.1% and easily missing sparse dirty data.`,
+    assessBtn: `Run assessment`,
+    assessBtnBusy: `Assessing… (sample scan, may take minutes)`,
+    step5Title: `Mode, concurrency, and start`,
+    modeMigrate: `Full migration (migrate)`,
+    modeLive: `Full + incremental tail (live)`,
+    modeWarn: `⚠️ <b>Full migration is a one-shot copy; it does not tail incremental changes.</b> If the source keeps taking writes during migration, those writes <b>will not</b> be migrated, and no error is raised. If you need a complete sync (including changes made during migration), choose “Full + incremental tail (live)”. Use full migration only when the source has stopped taking writes / you only need a snapshot. <span class="muted">(live mode requires a change stream to be created manually on the source Firestore first — see docs.)</span>`,
+    syncSecIdxLabel: `Copy source secondary indexes to target (on by default)`,
+    syncSecIdxHint: `The <code>_id</code> index is always built (required by Firestore, cannot be disabled). Turn this off to build <b>only <code>_id</code></b> and skip the source's secondary indexes — you can create them on the Firestore side as needed after migration.`,
+    tuneSummary: `Advanced: threads / concurrency settings`,
+    tInitWorkersLabel: `Full-load write workers`,
+    tInitWorkersPh: `default 5`,
+    tConcCollLabel: `Concurrent collections`,
+    tConcCollPh: `default 4`,
+    tIncWorkersLabel: `Incremental workers`,
+    tIncWorkersPh: `default = CPU`,
+    tMaxPartsLabel: `Max read partitions`,
+    tMaxPartsPh: `default 8`,
+    tWorkersPerPartLabel: `Workers per partition`,
+    tWorkersPerPartPh: `default 3`,
+    tMinDocsPerPartLabel: `Min docs per partition`,
+    tMinDocsPerPartPh: `default 10000`,
+    tMinDocsParallelLabel: `Parallel-read trigger · doc count`,
+    tMinDocsParallelPh: `default 50000`,
+    tParallelLabel: `Enable parallel partitioned reads for large collections`,
+    tuneHint1: `Blank = use engine defaults. Running the assessment above auto-fills the recommended values.`,
+    tuneHint2: `Large-collection long tail (a few big tables run for a long time): per-table parallelism ≈ <b>max read partitions × workers per partition</b>, independent of "concurrent collections". If a table is <b>large in bytes but few in rows</b> (below the "parallel-read trigger"), it degrades to a single-cursor sequential read and stalls — lower the <b>trigger threshold</b> and <b>min docs per partition</b> to let it use partitioned parallelism too.`,
+    startBtn: `Start migration`,
+    startBtnBusy: `Starting…`,
+    progressTitle: `Live progress`,
+    statusConnecting: `Connecting…`,
+    cutoverInitial: `Cutover readiness: no incremental data yet`,
+    resetBtn: `🧹 Reset session`,
+    resetHint: `Clears the remediation plan + removes finished jobs + deletes leftover files from the last run (the plan is backed up first; connection settings and cloud data are untouched).`,
+    speedTitle: `⚡ Live tuning`,
+    speedHint: `(no restart, no data cleared; applies to tables that <b>have not started loading</b> — tables already loading keep the config they started with)`,
+    rcConcLabel: `Concurrent tables`,
+    rcConcPh: `e.g. 8`,
+    rcMaxPartsLabel: `Global · partitions`,
+    rcMaxPartsPh: `e.g. 16`,
+    rcWorkersLabel: `Global · workers/partition`,
+    rcWorkersPh: `e.g. 5`,
+    applyGlobalBtn: `Apply global tuning`,
+    perCollHint: `Boost a single large table that <b>hasn't started yet</b> (optional; parallel partitioned reads are enabled for it automatically):`,
+    rcDbLabel: `Database`,
+    rcDbPh: `source DB name`,
+    rcCollLabel: `Collection`,
+    rcCollPh: `collection name`,
+    rcCMaxPartsLabel: `Partitions`,
+    rcCMaxPartsPh: `e.g. 32`,
+    rcCWorkersLabel: `Workers/partition`,
+    rcCWorkersPh: `e.g. 4`,
+    applyPerCollBtn: `Apply to this table`,
+    tabActive: `In progress / pending`,
+    tabDone: `Completed`,
+    thCollection: `DB.collection`,
+    thPhase: `Phase`,
+    thProgress: `Progress`,
+    thThroughput: `Throughput`,
+    thFailed: `Failed`,
+    thReady: `Ready`,
+    verifyTitle: `Post-migration verification`,
+    verifyDesc: `Compares document counts for each source→target collection (optional content hash). Run after the full load completes.`,
+    verifyBtn: `Verify migration result`,
+    verifyBtnBusy: `Verifying…`,
+    verifyBtnBusyHash: `Verifying… (with content hash, slower)`,
+    verifyHashLabel: `Also compare content hashes (slow)`,
+    modalTitle: `Create Firestore database`,
+    cancelBtn: `Cancel`,
+    createBtn: `Create`,
+    createBtnBusy: `Creating…`,
+    retryCreateBtn: `Retry create`,
+    // dynamic — detect
+    pillVersion: v => `Version ${v}`,
+    pillReplicaSet: v => `Replica set ${v}`,
+    pillDriver: v => `Driver ${v}`,
+    pillReplMethod: v => `Replication ${v}`,
+    planResetMsg: `↺ Source change detected: the previous remediation plan was cleared to avoid cross-database contamination.`,
+    planBackupNote: p => ` <span class="muted">(previous plan backed up to ${p})</span>`,
+    detectFailed: m => `Detection failed: ${m}`,
+    // dynamic — databases
+    inventoryFailed: r => `Could not auto-list databases/collections (${r}). Enter manually:`,
+    noInventory: `no inventory returned`,
+    manualDbLabel: `Source database name`,
+    manualCollsLabel: `Collections (comma-separated, blank = whole database)`,
+    manualCollsPh: `blank = migrate all collections`,
+    noUserDbs: `No migratable user databases in the source.`,
+    collCount: n => `(${n} collections)`,
+    // dynamic — firestore list
+    loading: ` Loading…`,
+    fireHintCount: (total, compat) => ` ${total} databases total, ${compat} MongoDB-compatible (usable as targets)`,
+    loadFailedText: m => ` Load failed: ${m}`,
+    statusTarget: (id, ep) => `✔ Target <code>${id}</code> · <span class="muted">${ep}</span>`,
+    createFsItem: q => `＋ Create Firestore database “${q}” <span class="tag">enterprise + mongodb compatible, takes minutes · billed</span>`,
+    invalidName: `Invalid name: 4–63 lowercase letters/digits/hyphens, must start with a letter`,
+    noMatchCompat: `No matching compatible databases`,
+    clickRefreshHint: `(click "Refresh Firestore database list" above)`,
+    incompatTag: ed => `${ed} · not MongoDB compatible, unavailable`,
+    // dynamic — create modal
+    willCreateFs: id => `Will create Firestore database <code>${id}</code> <span class="tag">Enterprise · MongoDB compatible (fixed)</span>`,
+    locationLabel: `Location (single region)`,
+    pitrLabel: `Enable Point-in-time recovery (PITR)`,
+    backupLabel: `Scheduled backups`,
+    backupNone: `No backups`,
+    backupDaily: `Daily (retain 7 days)`,
+    backupWeekly: `Weekly (Monday, retain 14 weeks)`,
+    createBillWarn: `Creation takes minutes and incurs billing.`,
+    creatingTarget: id => `⏳ Creating <code>${id}</code>… (a few minutes, don't close the page)`,
+    createdNote: ` <span class="ok">(created)</span>`,
+    createFailedPrefix: `Create failed: `,
+    // dynamic — assess
+    assessNoSel: `Select databases/collections to assess in step 2 first.`,
+    assessFailed: m => `Assessment failed: ${m}`,
+    // FIXABLE notes
+    fixable_collNameReserved: `Rename target collection __x__→_x_ (recorded in name-map; the app must access it by the new name)`,
+    fixable_idReserved: `Reserved _id __x__→_x_ (recorded in id-map; cross-collection references must be updated per the map)`,
+    fixable_nestingDepth: `Subtrees below level 20 are serialized to a JSON string (data preserved; loses query-ability of that subtree)`,
+    fixable_fieldPathLength: `Subtree at the over-long path is serialized to a JSON string (data preserved; loses query-ability of that subtree)`,
+    fixable_fieldNameLength: `Over-long field names are truncated + hash-renamed (recorded in name-map; the app must access by the new name)`,
+    fixable_fieldNameReserved: `Reserved field name __x__→_x_ (recursively, whole document; recorded in name-map; the app must access by the new name)`,
+    fixable_valueSize: `Over-large values are chunked into {_chunked_, parts:[…]} (the app must reassemble in order)`,
+    // stragglers
+    stragglerHeader: n => `⚠ Large-collection recommendations (${n} "large in bytes, few in rows" tables that would otherwise degrade to a single-cursor sequential read)`,
+    stragglerDesc: `Per-table "parallel partition" overrides have been pre-filled for these tables (editable per table). They apply only to these tables and don't affect others; they're sent with the job at start. They also apply to whole-database migrations.`,
+    enableParallelPart: `Enable parallel partitions`,
+    partitions: `Partitions`,
+    workersPerPart: `Workers/partition`,
+    minDocsPerPart: `Min docs/partition`,
+    triggerThreshold: `Trigger threshold · doc count`,
+    // assess report pills
+    pillDbColl: (dbs, colls) => `${dbs} databases / ${colls} collections`,
+    pillDocs: (total, insp, pct) => `Total docs ${total} · sampled ${insp} (coverage ${pct}%)`,
+    pillStrategy: (floor, ratePct, cap) => `Strategy ≥${floor}/table · ${ratePct}% · cap ${cap}`,
+    pillBlock: b => `B blocking ${b}`,
+    pillAutoFix: a => `A auto-fix ${a}`,
+    pillWarn: c => `C warning ${c}`,
+    blockingMsg: b => `There are ${b} blocking issue(s) (B) that must be resolved before migrating.`,
+    noBlockingMsg: `✅ No blocking issues; you can migrate (A = auto-fix, C = advisory).`,
+    pendbarText: size => `You've chosen to fix <b>${size}</b> item(s) (<b>the source is never modified</b>; fixes happen only at migration write time). Keep selecting items, then click the button on the right to re-detect: it simulates applying the fixes you chose and shows what remains.`,
+    reDetectBtn: size => `Re-detect (simulate the ${size} chosen fix(es))`,
+    indexBudget: limit => `<b>Index budget</b> (full scan, not sampled · Firestore limit ${limit} per database):`,
+    thTargetDb: `Target DB`,
+    thSecIdx: `Source secondary indexes`,
+    thIdIdx: `+ _id index`,
+    thTotal: `Total`,
+    thHeadroom: `Headroom`,
+    overBy: n => `over by ${n}`,
+    chosenFixesTitle: `<b>Fixes you've chosen</b> <span class="muted">(source unchanged; transformed only at migration write time; click "Don't fix" to drop)</span>`,
+    auditNote: `At migration, every actual change is appended to <code>remediation-audit.jsonl</code>: database/collection/_id + each field's <b>original data (before)</b>, <b>violation</b>, and <b>fixed value (after)</b> (over-large values summarized + sha1), for later review.`,
+    thRule: `Rule`,
+    thLocation: `Location`,
+    thFixPlan: `Fix plan`,
+    thAction: `Action`,
+    cancelledPending: `Cancelled (pending re-detect)`,
+    reselectFix: `Re-select fix`,
+    dontFixBtn: `Don't fix`,
+    problemsTitle: `<b>Issues that block / affect migration</b> <span class="muted">(aggregated by collection + rule; expand to see real samples)</span>`,
+    problemsDesc: `Each row suggests a fix. To fix, click "Select fix" (<b>only registered; source unchanged</b>; transformed at migration write time); to skip, leave it as-is. When done, click "Re-detect" above to see what remains.`,
+    thSeverity: `Severity`,
+    thHits: `Hits`,
+    thProblem: `Problem`,
+    thFixAction: `Fix plan / action`,
+    autoFixNote: `Auto-fixed at migration<br>no action needed`,
+    fixSelected: `Fix selected ✓`,
+    dontFix: `Don't fix`,
+    selectFix: `Select fix`,
+    noAutoFix: `No auto-fix<br>manual handling needed`,
+    expandSamples: n => `Expand samples (${n}) ▾`,
+    sampleDocsNote: `Real documents that matched in the sample (examples only; unsampled documents of the same kind aren't guaranteed clean):`,
+    thDocId: `Document _id`,
+    thProblemDetail: `Problem detail`,
+    recommendedTuning: `<b>Recommended concurrency</b> (already filled into "Advanced" below, editable):`,
+    pillFullWorker: n => `Full-load workers ${n}`,
+    pillConcColl: n => `Concurrent collections ${n}`,
+    pillIncWorker: n => `Incremental workers ${n}`,
+    pillParallel: (enabled, mp, w) => enabled ? `Parallel reads on · ${mp} partitions × ${w} workers` : `Parallel reads off`,
+    pillPartThreshold: (a, b) => `Partition threshold ${a} / per partition ${b}`,
+    tunePrefilledNote: `(pre-filled from assessment recommendation)`,
+    ratInitWorkers: `Initial-load write workers derived from CPU and data volume (+1 per ~250k docs, capped at 2×CPU)`,
+    ratConcColl: `Concurrent collections = min(CPU, collection count, 8)`,
+    ratIncWorkers: `Incremental workers = number of CPU cores`,
+    ratParallelOn: `Largest collection exceeds 50k docs → enable parallel partitioned reads`,
+    ratParallelOff: `Largest collection is small (<50k docs) → parallel partitioned reads not needed`,
+    ratPartitionKnobs: `Partition-granularity knobs use engine defaults (3 workers/partition, ~10k docs/partition, 50k-doc parallel-read threshold); for long-tail large collections, lower the threshold manually to force partitioned parallel reads`,
+    // assess finding details (backend emits key + args)
+    detCollNameLength: (a, b) => `collection name is ${a} bytes (limit ${b})`,
+    detCollNameReserved: `collection name matches reserved __.*__ pattern`,
+    detCollNameDollar: `collection name contains '$'`,
+    detCollNameSystem: `collection name uses reserved 'system.' prefix`,
+    detIdLength: (a, b) => `string _id is ${a} bytes (limit ${b})`,
+    detIdReserved: `string _id matches reserved __.*__ pattern`,
+    detIdTypeConvert: a => `_id type ${a} will be converted to string (recorded in id-map)`,
+    detDocSize: (a, b) => `document is ${a} bytes (limit ${b})`,
+    detNestingDepth: (a, b) => `nesting exceeds ${a} levels at path "${b}"`,
+    detValueSizeStr: (a, b, c) => `string value at "${a}" is ${b} bytes (limit ${c})`,
+    detValueSizeBin: (a, b, c) => `binary value at "${a}" is ${b} bytes (limit ${c})`,
+    detFieldNameLength: (a, b, c) => `field name at "${a}" is ${b} bytes (limit ${c})`,
+    detFieldNameReserved: (a, b) => `field name "${a}" at "${b}" matches reserved __.*__ (rejected by Firestore)`,
+    detFieldPathLength: (a, b, c) => `field path "${a}" is ${b} bytes (limit ${c})`,
+    detIndexBudgetB: (a, b) => `database has ${a} indexes (limit ${b})`,
+    detIndexBudgetC: (a, b) => `database has ${a} indexes, nearing limit ${b}`,
+    detDatabaseBudget: (a, b) => `migration needs ${a} Firestore databases (limit ${b} per project)`,
+    // remediation notes (static)
+    noteRenameCollection: `Rename target collection __x__→_x_ (recorded in name-map; app must use the new name)`,
+    noteRewriteID: `Rewrite reserved _id __x__→_x_ (recorded in id-map; cross-collection references must follow the map)`,
+    noteSerializeNesting: `Serialize the subtree below level 20 to a JSON string (data preserved; that subtree loses queryability)`,
+    noteSerializePath: `Serialize the subtree at the over-long path to a JSON string (data preserved; that subtree loses queryability)`,
+    noteRenameField: `Truncate + hash-rename the over-long field name (recorded in name-map; app must use the new name)`,
+    noteSanitizeFieldNames: `Rewrite reserved field names __x__→_x_ (recursively across the document; recorded in name-map; app must use the new name)`,
+    noteChunkValue: `Split the over-large value into {_chunked_,parts:[…]} (app must reassemble in order)`,
+    // straggler reason (key + args)
+    reasonStraggler: (a, b, c, d, e) => `Byte-heavy but few documents: ~${a} docs × avg ${b} ≈ ${c}; doc count is below the global parallel-read threshold (${d}) so it degrades to a single cursor — recommend splitting into ${e} partitions`,
+    registerFailed: `Registration failed: `,
+    // start
+    startNoSel: `Select at least one database/collection.`,
+    unmappedStart: list => `These source databases aren't mapped to a Firestore target yet: ${list}`,
+    jobStarted: id => `<span class="ok">Started job <code>${id}</code></span>`,
+    startFailed: m => `Start failed: ${m}`,
+    // verify
+    verifyNoSel: `No databases/collections to verify.`,
+    unmappedVerify: list => `These source databases aren't mapped to a target, so they can't be verified: ${list}`,
+    verifyFailed: m => `Verification failed: ${m}`,
+    verifyAllPass: n => `✅ All ${n} collections passed verification`,
+    verifySomeFail: `❌ Some collections failed (see the table below)`,
+    thSourceCount: `Source count`,
+    thTargetCount: `Target count`,
+    thCount: `Count`,
+    thHash: `Hash`,
+    thNote: `Note`,
+    match: `match`,
+    mismatch: `mismatch`,
+    notChecked: `not checked`,
+    mismatchIds: list => `mismatched _id: ${list}`,
+    // fmt / control
+    unknown: `unknown`,
+    controlFailed: `Control failed: `,
+    noRunningJob: `No running job`,
+    fillDbColl: `Enter a database name and collection name`,
+    fillOneCollNum: `Enter at least one value (partitions or workers/partition)`,
+    fillOneNum: `Enter at least one value`,
+    applied: `applied`,
+    stopConfirm: `Are you sure you want to "Stop" this job?\n\nStopping ends the job for good. A subsequent "Start" will clear the resume token and dead-letter queue and re-migrate everything from scratch.\n\nIf you only want to pause temporarily and later resume in place, use "Pause" instead.`,
+    // state labels
+    state_created: `Created`,
+    state_assessing: `Assessing`,
+    state_initialLoad: `Full load in progress`,
+    state_live: `Tailing incremental`,
+    state_verifying: `Verifying`,
+    state_done: `Stopped / Completed`,
+    state_failed: `Failed`,
+    state_paused: `Paused`,
+    // job controls
+    pauseTitle: `Pause: suspend processing only; the job and resume token are fully retained. Click "Resume" to continue in place. No re-migration.`,
+    resumeTitle: `Resume: continue processing in place from where it paused; new data written to the source during the pause is caught up.`,
+    stopTitle: `Stop: end this job for good. A fresh "Start" clears the resume token and dead-letter queue and re-migrates everything from scratch — to pause temporarily use "Pause" instead.`,
+    pause: `Pause`,
+    paused: `Paused`,
+    resume: `Resume`,
+    stop: `Stop`,
+    stopped: `Stopped`,
+    buildingIdx: name => ` <span class="muted">· building: ${name}</span>`,
+    idxDone: ` <span class="muted">· done</span>`,
+    creatingIdx: (done, tot) => `Creating indexes ${done}/${tot}`,
+    pauseStopHint: `Pause = suspend, resumable in place (no re-migration); Stop = end the job — starting again re-migrates everything from scratch and clears the dead-letter queue.`,
+    // cutover
+    cutoverInitialDesc: `Once "incremental tail" begins, this aggregates all collections to judge whether it's safe to cut over.`,
+    cutoverReadyPrefix: `Cutover readiness: `,
+    cutoverRedTitle: `Cutover blocked: failures / DLQ not yet cleared`,
+    cutoverRedStep: `Clear failures and the dead-letter queue (see details below) first, then consider cutting over.`,
+    cutoverAmberTitle: `Catching up: readiness conditions not yet met`,
+    cutoverAmberStep: (lag, stable, minStreak) => `Requires Lag ≤ ${lag}s and ${stable} consecutive healthy cycles (current minimum ${minStreak}/${stable}).`,
+    cutoverGreenTitle: `Ready: safe to cut over`,
+    cutoverGreenStep: `Cutover steps: ① stop writes to the source → ② confirm this card stays green and Lag = idle → ③ run "Verify migration result" below to compare counts → ④ point the app to Firestore.`,
+    liveColls: n => `Incremental collections ${n}`,
+    cumEvents: n => `cumulative events ${n}`,
+    failedLabel: `Failed`,
+    maxLag: txt => `max Lag ${txt}`,
+    minStable: (a, b) => `min stable ${a}/${b}`,
+    idle: `idle`,
+    // DLQ
+    dlqBanner: n => `⛔ The dead-letter queue has <b>${n}</b> unresolved failed document(s); they must be cleared to zero before cutover.`,
+    viewDetails: `View details`,
+    collapseDetails: `Collapse details`,
+    dlqPanelTitle: n => `Dead-letter queue details (aggregated by source collection) · ${n} total`,
+    dlqRetryNote: `Fix these documents directly in the <b>source</b> (<b>keep _id unchanged</b>); incremental replication replays the change as an update into the target, and the corresponding dead-letter entries clear automatically — no downtime or manual retry needed.`,
+    entriesCount: n => `· ${n} entries`,
+    showingFirst: n => ` <span class="muted">(showing first ${n})</span>`,
+    thOp: `op`,
+    thError: `Error`,
+    thTime: `Time`,
+    noDocSnapshot: `(no document snapshot saved)`,
+    // reset
+    resetJobRunning: `A job is running; "Stop" it before resetting.`,
+    resetConfirm: `Resetting the session will:\n· Clear the remediation plan (original file auto-backed-up)\n· Remove finished jobs and their rows from the board\n· Delete leftover files from the last run (DLQ, checkpoints, id maps, audit logs)\n\nConnection settings are not changed, and cloud Firestore data is untouched.\n\nContinue?`,
+    resetFailed: `Reset failed: `,
+    resetDone: `Session reset.\n`,
+    resetPlanCleared: `· Remediation plan cleared`,
+    backedUpTo: p => `(backed up to ${p})`,
+    resetJobsPurged: n => `· Removed ${n} finished job(s)\n`,
+    resetFilesRemoved: n => `· Deleted ${n} leftover file(s)`,
+    // rows
+    phError: `Error`,
+    cannotStartRepl: `could not start replication`,
+    phLiveStopped: `Incremental · stopped`,
+    phLive: `Incremental`,
+    phInitial: `Full`,
+    events: `events`,
+    docs: `docs`,
+    eventsStopped: n => `${n} events · stopped`,
+    eventsTailing: n => `${n} events · tailing`,
+    writtenCounting: n => `${n} written (counting…)`,
+    rdyGreen: `Ready`,
+    rdyAmber: `Catching up`,
+    rdyRed: `Blocked`,
+    tipRed: (failed, dlq) => `Failed ${failed} / DLQ ${dlq}, must be cleared`,
+    tipGreen: (streak, need) => `${streak}/${need} consecutive healthy cycles`,
+    tipLagHigh: thr => `Lag too high (threshold ${thr}s)`,
+    tipStabilizing: (streak, need) => `Stabilizing ${streak}/${need}`,
+    // pager
+    noCollsInTab: `(No collections in this category)`,
+    prevPage: `‹ Prev`,
+    nextPage: `Next ›`,
+    pagerInfo: (cur, pages, total, size) => `Page ${cur} / ${pages} · ${total} collections (${size} per page)`,
+    totalColls: n => `${n} collections`,
+    connLost: `⚠ Connection lost, retrying…`,
+  },
+  zh: {
+    appTitle: `Firestore 容灾迁移控制台（单区域 → 多区域）`,
+    subtitle: `网页里配置并发起迁移：检测源 → 勾选库表 → 把每个源库映射到一个多区域 Firestore 目标库 → 选模式 → 开始，本页实时看进度。`,
+    step1Title: `源 Firestore（单区域）`,
+    sourceConnLabel: `源连接串`,
+    detectBtn: `检测源服务器`,
+    detectBtnBusy: `检测中…`,
+    detectHint: `&nbsp;检测版本 / 拓扑 / 复制方式，并列出库表`,
+    step2Title: `选择要迁移的库 / 集合`,
+    step3Title: `源库 → Firestore 目标映射`,
+    step3Desc: `每个源 Firestore 库对应一个多区域 Firestore 目标库，各自独立 endpoint。为每个已勾选的源库指定一个目标：可选已有库（可搜索），或输入新名字点「新建」。目标必须是已建好的空多区域库。`,
+    refreshFsBtn: `刷新 Firestore 库列表`,
+    thSourceDb: `源库`,
+    thFsTarget: `Firestore 目标库`,
+    mapInputPh: `搜索已有库，或输入新名字…`,
+    mapEmpty: `（先在上一步勾选源库/集合，这里会自动生成映射行）`,
+    authLabel: `认证方式（对所有目标库生效）`,
+    authOidc: `服务账号 OIDC（免密码，长跑推荐）`,
+    authScram: `SCRAM 用户名/密码`,
+    scramUser: `用户名`,
+    scramPass: `密码`,
+    step4Title: `预迁移评估（可选，但推荐）`,
+    step4Desc: `抽样扫描已勾选的源库/集合，检查 Firestore 兼容性风险（文档大小、字段名、嵌套深度、索引预算…），并据数据量与本机 CPU 推荐并发配置。`,
+    sampleSummary: `抽样设置`,
+    sampleSummaryHint: `（越大越准，越慢越贵；留空=默认）`,
+    sFloorLabel: `每集合最少抽样`,
+    sFloorPh: `默认 1000`,
+    sRateLabel: `按比例抽样 %`,
+    sRatePh: `默认 0.1`,
+    sCapLabel: `每集合抽样上限`,
+    sCapPh: `默认 50000`,
+    sampleFormula: `每个集合抽 <code>clamp(最少, 上限, max(最少, 总数×比例))</code> 条。大表按比例保证覆盖率，上限控成本。旧逻辑是每集合固定 1000，百万级大表抽样率不足 0.1%，易漏稀疏脏数据。`,
+    assessBtn: `运行评估`,
+    assessBtnBusy: `评估中…（抽样扫描，可能数分钟）`,
+    step5Title: `模式、并发配置并开始`,
+    modeMigrate: `全量迁移 (migrate)`,
+    modeLive: `全量 + 增量追尾 (live)`,
+    modeWarn: `⚠️ <b>全量迁移是一次性拷贝，不追增量。</b>迁移期间源库若仍有写入，这些写入<b>不会</b>被迁移，且不会报错。需要完整同步（含迁移期间的变更）请选「全量 + 增量追尾 (live)」。仅在源库已停写 / 只要快照时用它。<span class="muted">（live 模式需先在源 Firestore 上手动创建 change stream，见文档。）</span>`,
+    syncSecIdxLabel: `复制源库二级索引到目标（默认开）`,
+    syncSecIdxHint: `<code>_id</code> 索引始终会建（Firestore 刚需，无法关闭）。关掉此项则<b>只建 <code>_id</code></b>，源库的二级索引不复制——你可在迁移完成后自行在 Firestore 端按需创建。`,
+    tuneSummary: `高级：线程 / 并发配置`,
+    tInitWorkersLabel: `全量写入 worker 数`,
+    tInitWorkersPh: `默认 5`,
+    tConcCollLabel: `并发集合数`,
+    tConcCollPh: `默认 4`,
+    tIncWorkersLabel: `增量 worker 数`,
+    tIncWorkersPh: `默认=CPU`,
+    tMaxPartsLabel: `最大读取分区数`,
+    tMaxPartsPh: `默认 8`,
+    tWorkersPerPartLabel: `每分区 worker 数`,
+    tWorkersPerPartPh: `默认 3`,
+    tMinDocsPerPartLabel: `每分区最少文档数`,
+    tMinDocsPerPartPh: `默认 10000`,
+    tMinDocsParallelLabel: `并行读触发阈值·文档数`,
+    tMinDocsParallelPh: `默认 50000`,
+    tParallelLabel: `启用大集合并行分区读取`,
+    tuneHint1: `留空 = 使用引擎默认值。运行上方评估后会自动填入推荐值。`,
+    tuneHint2: `巨表长尾（少数大表跑很久）：单表并行度 ≈ <b>最大读取分区数 × 每分区 worker 数</b>，与「并发集合数」无关。若某表<b>字节大但条数少</b>（不到「并行读触发阈值」），会退化成单游标顺序读而卡住——把<b>触发阈值</b>和<b>每分区最少文档数</b>调低即可让它也走分区并行。`,
+    startBtn: `开始迁移`,
+    startBtnBusy: `启动中…`,
+    progressTitle: `实时进度`,
+    statusConnecting: `连接中…`,
+    cutoverInitial: `切换就绪：尚无增量数据`,
+    resetBtn: `🧹 重置会话`,
+    resetHint: `清空修复计划 + 移除已结束任务 + 删除上次运行残留文件（会先备份计划；不动连接配置与云端数据）。`,
+    speedTitle: `⚡ 运行中调速`,
+    speedHint: `（不重启任务、不清数据；对<b>尚未开始加载</b>的表生效——正在加载的表保持其启动时的配置）`,
+    rcConcLabel: `同时迁移表数`,
+    rcConcPh: `如 8`,
+    rcMaxPartsLabel: `全局·分区数`,
+    rcMaxPartsPh: `如 16`,
+    rcWorkersLabel: `全局·每区 worker`,
+    rcWorkersPh: `如 5`,
+    applyGlobalBtn: `应用全局调速`,
+    perCollHint: `给某张<b>还没开始</b>的大表单独加码（可选，会自动为它开启并行分区读）：`,
+    rcDbLabel: `库`,
+    rcDbPh: `源库名`,
+    rcCollLabel: `集合`,
+    rcCollPh: `集合名`,
+    rcCMaxPartsLabel: `分区数`,
+    rcCMaxPartsPh: `如 32`,
+    rcCWorkersLabel: `每区 worker`,
+    rcCWorkersPh: `如 4`,
+    applyPerCollBtn: `应用到该表`,
+    tabActive: `进行中 / 待处理`,
+    tabDone: `已完成`,
+    thCollection: `库.集合`,
+    thPhase: `阶段`,
+    thProgress: `进度`,
+    thThroughput: `吞吐`,
+    thFailed: `失败`,
+    thReady: `就绪`,
+    verifyTitle: `迁移后校验`,
+    verifyDesc: `对每个源→目标集合比对文档计数（可选内容哈希）。全量完成后再点。`,
+    verifyBtn: `验证迁移结果`,
+    verifyBtnBusy: `校验中…`,
+    verifyBtnBusyHash: `校验中…（含内容哈希，较慢）`,
+    verifyHashLabel: `同时比对内容哈希（慢）`,
+    modalTitle: `新建 Firestore 库`,
+    cancelBtn: `取消`,
+    createBtn: `创建`,
+    createBtnBusy: `创建中…`,
+    retryCreateBtn: `重试创建`,
+    pillVersion: v => `版本 ${v}`,
+    pillReplicaSet: v => `副本集 ${v}`,
+    pillDriver: v => `驱动 ${v}`,
+    pillReplMethod: v => `复制方式 ${v}`,
+    planResetMsg: `↺ 检测到 source 变更：已清空上一次的修复计划，避免跨库串味。`,
+    planBackupNote: p => ` <span class="muted">（旧计划已备份到 ${p}）</span>`,
+    detectFailed: m => `检测失败：${m}`,
+    inventoryFailed: r => `无法自动列举库表（${r}）。手动填写：`,
+    noInventory: `未返回清单`,
+    manualDbLabel: `源数据库名`,
+    manualCollsLabel: `集合名（逗号分隔，留空=整库）`,
+    manualCollsPh: `留空迁移全部集合`,
+    noUserDbs: `源中没有可迁移的用户数据库。`,
+    collCount: n => `(${n} 集合)`,
+    loading: ` 加载中…`,
+    fireHintCount: (total, compat) => ` 共 ${total} 个库，其中 ${compat} 个 MongoDB 兼容(可作目标)`,
+    loadFailedText: m => ` 加载失败：${m}`,
+    statusTarget: (id, ep) => `✔ 目标 <code>${id}</code> · <span class="muted">${ep}</span>`,
+    createFsItem: q => `＋ 新建 Firestore 库「${q}」 <span class="tag">enterprise + mongodb 兼容，需数分钟·计费</span>`,
+    invalidName: `名字非法：4–63 位小写字母/数字/连字符，字母开头`,
+    noMatchCompat: `无匹配的兼容库`,
+    clickRefreshHint: `（点上方"刷新 Firestore 库列表"）`,
+    incompatTag: ed => `${ed} · 非 MongoDB 兼容，不可选`,
+    willCreateFs: id => `将创建 Firestore 库 <code>${id}</code> <span class="tag">Enterprise · MongoDB 兼容（固定）</span>`,
+    locationLabel: `位置（单区域）`,
+    pitrLabel: `启用 Point-in-time recovery (PITR)`,
+    backupLabel: `计划备份 (Scheduled backups)`,
+    backupNone: `不备份`,
+    backupDaily: `每日（保留 7 天）`,
+    backupWeekly: `每周（周一，保留 14 周）`,
+    createBillWarn: `创建需数分钟并产生计费。`,
+    creatingTarget: id => `⏳ 正在创建 <code>${id}</code>…（数分钟，别关页面）`,
+    createdNote: ` <span class="ok">(已创建)</span>`,
+    createFailedPrefix: `创建失败：`,
+    assessNoSel: `请先在第 2 步勾选要评估的库/集合。`,
+    assessFailed: m => `评估失败：${m}`,
+    fixable_collNameReserved: `目标集合改名 __x__→_x_（记入 name-map；app 需按新名访问）`,
+    fixable_idReserved: `保留 _id __x__→_x_（记入 id-map；跨集合引用需按 map 更新）`,
+    fixable_nestingDepth: `第 20 层以下子树序列化为 JSON 字符串（保数据，丢该子树可查询性）`,
+    fixable_fieldPathLength: `超长路径处子树序列化为 JSON 字符串（保数据，丢该子树可查询性）`,
+    fixable_fieldNameLength: `超长字段名截断+哈希改名（记入 name-map；app 需按新名访问）`,
+    fixable_fieldNameReserved: `保留字段名 __x__→_x_（递归全文档；记入 name-map；app 需按新名访问）`,
+    fixable_valueSize: `超大值分片为 {_chunked_,parts:[…]}（app 需按序拼回）`,
+    stragglerHeader: n => `⚠ 巨表长尾建议（${n} 张"字节大条数少"的表，默认会退化成单游标顺序读）`,
+    stragglerDesc: `已为这些表预填「每表并行分区」override（可逐表改）。仅对这些表生效、不影响其他表；开始迁移时随任务下发。整库迁移下同样有效。`,
+    enableParallelPart: `启用并行分区`,
+    partitions: `分区数`,
+    workersPerPart: `每分区 worker`,
+    minDocsPerPart: `每分区最少文档`,
+    triggerThreshold: `触发阈值·文档数`,
+    pillDbColl: (dbs, colls) => `${dbs} 库 / ${colls} 集合`,
+    pillDocs: (total, insp, pct) => `总文档 ${total} · 抽样 ${insp}（覆盖 ${pct}%）`,
+    pillStrategy: (floor, ratePct, cap) => `策略 每表≥${floor} · ${ratePct}% · 上限 ${cap}`,
+    pillBlock: b => `B 阻断 ${b}`,
+    pillAutoFix: a => `A 自动修复 ${a}`,
+    pillWarn: c => `C 警告 ${c}`,
+    blockingMsg: b => `存在 ${b} 项阻断性问题（B），迁移前必须解决。`,
+    noBlockingMsg: `✅ 无阻断性问题，可以迁移（A 自动修复、C 为提醒）。`,
+    pendbarText: size => `你已选择修复 <b>${size}</b> 项（<b>源库不会被改动</b>，修复只在迁移写入时发生）。可继续逐条勾选，选完后点右侧按钮统一重新检测：模拟应用你选择的修复，看看还剩哪些没解决。`,
+    reDetectBtn: size => `重新检测（模拟已选 ${size} 项修复）`,
+    indexBudget: limit => `<b>索引预算</b>（全表扫描，未抽样 · Firestore 每库上限 ${limit}）：`,
+    thTargetDb: `目标库`,
+    thSecIdx: `源二级索引`,
+    thIdIdx: `+_id 索引`,
+    thTotal: `合计`,
+    thHeadroom: `剩余余量`,
+    overBy: n => `超出 ${n}`,
+    chosenFixesTitle: `<b>你已选择修复的项</b> <span class="muted">（源库不改动，迁移写入时才转换；不想修就点「不修复了」）</span>`,
+    auditNote: `迁移时每条实际改动会逐条写入 <code>remediation-audit.jsonl</code>：库/集合/_id + 每个字段的<b>原数据(before)</b>、<b>报错(violation)</b>、<b>修完(after)</b>（超大值摘要+sha1），便于日后复查。`,
+    thRule: `规则`,
+    thLocation: `位置`,
+    thFixPlan: `修复方案`,
+    thAction: `操作`,
+    cancelledPending: `已取消（待重新检测）`,
+    reselectFix: `重新选择修复`,
+    dontFixBtn: `不修复了`,
+    problemsTitle: `<b>无法/影响迁移的问题</b> <span class="muted">（按集合+规则汇总，展开看真实样例数据）</span>`,
+    problemsDesc: `每条给出建议的修复方案。想修就点「选择修复」（<b>只是登记，源库不改</b>，迁移写入时才转换）；不想修就不点，保持原样。选完后可点上方「重新检测」看还剩哪些。`,
+    thSeverity: `级别`,
+    thHits: `命中`,
+    thProblem: `问题`,
+    thFixAction: `修复方案 / 操作`,
+    autoFixNote: `迁移时自动修复<br>无需操作`,
+    fixSelected: `已选择修复 ✓`,
+    dontFix: `不修复`,
+    selectFix: `选择修复`,
+    noAutoFix: `无自动修复<br>需人工处理`,
+    expandSamples: n => `展开样例 (${n}) ▾`,
+    sampleDocsNote: `抽样中命中的真实文档（仅示例，未抽到的同类文档不代表没问题）：`,
+    thDocId: `文档 _id`,
+    thProblemDetail: `问题详情`,
+    recommendedTuning: `<b>推荐并发配置</b>（已填入下方「高级」，可改）：`,
+    pillFullWorker: n => `全量 worker ${n}`,
+    pillConcColl: n => `并发集合 ${n}`,
+    pillIncWorker: n => `增量 worker ${n}`,
+    pillParallel: (enabled, mp, w) => enabled ? `并行读 开 · ${mp} 分区 × ${w} worker` : `并行读 关`,
+    pillPartThreshold: (a, b) => `分区阈值 ${a} / 每区 ${b}`,
+    tunePrefilledNote: `（已按评估推荐预填）`,
+    ratInitWorkers: `全量写入 worker 数按 CPU 与数据量推导（每约 25 万文档 +1，上限 2×CPU）`,
+    ratConcColl: `并发集合数 = min(CPU, 集合数, 8)`,
+    ratIncWorkers: `增量 worker 数 = CPU 核数`,
+    ratParallelOn: `最大集合超过 5 万文档 → 启用分区并行读`,
+    ratParallelOff: `最大集合较小（<5 万文档）→ 无需分区并行读`,
+    ratPartitionKnobs: `分区粒度参数用引擎默认值（每分区 3 worker、每分区约 1 万文档、5 万文档并行读阈值）；对长尾大集合，可手动调低阈值以强制分区并行读`,
+    // 评估问题详情（后端发 key + 参数）
+    detCollNameLength: (a, b) => `集合名 ${a} 字节（上限 ${b}）`,
+    detCollNameReserved: `集合名命中保留的 __.*__ 模式`,
+    detCollNameDollar: `集合名包含 '$'`,
+    detCollNameSystem: `集合名使用了保留前缀 'system.'`,
+    detIdLength: (a, b) => `字符串 _id ${a} 字节（上限 ${b}）`,
+    detIdReserved: `字符串 _id 命中保留的 __.*__ 模式`,
+    detIdTypeConvert: a => `_id 类型 ${a} 将被转换为字符串（记入 id-map）`,
+    detDocSize: (a, b) => `文档 ${a} 字节（上限 ${b}）`,
+    detNestingDepth: (a, b) => `嵌套超过 ${a} 层，路径 "${b}"`,
+    detValueSizeStr: (a, b, c) => `路径 "${a}" 处字符串值 ${b} 字节（上限 ${c}）`,
+    detValueSizeBin: (a, b, c) => `路径 "${a}" 处二进制值 ${b} 字节（上限 ${c}）`,
+    detFieldNameLength: (a, b, c) => `路径 "${a}" 处字段名 ${b} 字节（上限 ${c}）`,
+    detFieldNameReserved: (a, b) => `字段名 "${a}"（位于 "${b}"）命中保留的 __.*__（被 Firestore 拒绝）`,
+    detFieldPathLength: (a, b, c) => `字段路径 "${a}" 共 ${b} 字节（上限 ${c}）`,
+    detIndexBudgetB: (a, b) => `数据库有 ${a} 个索引（上限 ${b}）`,
+    detIndexBudgetC: (a, b) => `数据库有 ${a} 个索引，接近上限 ${b}`,
+    detDatabaseBudget: (a, b) => `迁移需要 ${a} 个 Firestore 数据库（每项目上限 ${b}）`,
+    // 修复方案 note（静态）
+    noteRenameCollection: `重命名目标集合 __x__→_x_（记入 name-map；应用需改用新名）`,
+    noteRewriteID: `改写保留 _id __x__→_x_（记入 id-map；跨集合引用须按映射同步）`,
+    noteSerializeNesting: `将第 20 层以下的子树序列化为 JSON 字符串（数据保留；该子树失去可查询性）`,
+    noteSerializePath: `将超长路径处的子树序列化为 JSON 字符串（数据保留；该子树失去可查询性）`,
+    noteRenameField: `截断 + 哈希重命名超长字段名（记入 name-map；应用需改用新名）`,
+    noteSanitizeFieldNames: `改写保留字段名 __x__→_x_（在整个文档内递归；记入 name-map；应用需改用新名）`,
+    noteChunkValue: `将超大值拆分为 {_chunked_,parts:[…]}（应用需按顺序重组）`,
+    // 巨表长尾 reason（key + 参数）
+    reasonStraggler: (a, b, c, d, e) => `字节大但文档少：约 ${a} 文档 × 平均 ${b} ≈ ${c}；文档数低于全局并行读阈值（${d}），会退化为单游标 —— 建议拆成 ${e} 个分区`,
+    registerFailed: `登记失败：`,
+    startNoSel: `请至少勾选一个库/集合。`,
+    unmappedStart: list => `这些源库还没映射 Firestore 目标：${list}`,
+    jobStarted: id => `<span class="ok">已启动 job <code>${id}</code></span>`,
+    startFailed: m => `启动失败：${m}`,
+    verifyNoSel: `没有可校验的库/集合。`,
+    unmappedVerify: list => `这些源库还没映射目标，无法校验：${list}`,
+    verifyFailed: m => `校验失败：${m}`,
+    verifyAllPass: n => `✅ 全部 ${n} 个集合校验通过`,
+    verifySomeFail: `❌ 有集合未通过（见下表）`,
+    thSourceCount: `源计数`,
+    thTargetCount: `目标计数`,
+    thCount: `计数`,
+    thHash: `哈希`,
+    thNote: `说明`,
+    match: `一致`,
+    mismatch: `不一致`,
+    notChecked: `未查`,
+    mismatchIds: list => `不匹配 _id: ${list}`,
+    unknown: `未知`,
+    controlFailed: `控制失败：`,
+    noRunningJob: `没有正在运行的任务`,
+    fillDbColl: `请填写库名和集合名`,
+    fillOneCollNum: `请至少填一个数值（分区数或每区 worker）`,
+    fillOneNum: `请至少填一个数值`,
+    applied: `已应用`,
+    stopConfirm: `确定「停止」这个任务吗？\n\n停止会彻底结束本任务。之后重新「启动」会清空续传位点(resume token)与死信队列，从头开始全量重迁。\n\n如果只是想临时挂起、稍后原地继续，请改用「暂停」。`,
+    state_created: `已创建`,
+    state_assessing: `评估中`,
+    state_initialLoad: `全量迁移中`,
+    state_live: `增量追尾中`,
+    state_verifying: `校验中`,
+    state_done: `已停止 / 已完成`,
+    state_failed: `已失败`,
+    state_paused: `已暂停`,
+    pauseTitle: `暂停：仅挂起处理，任务与续传位点(resume token)全部保留，点「继续」原地恢复。不会重迁。`,
+    resumeTitle: `继续：从暂停处原地恢复处理，暂停期间源库产生的新数据会被追上。`,
+    stopTitle: `停止：彻底结束本任务。重新「启动」会清空续传位点与死信队列、从头全量重迁——只想临时挂起请改用「暂停」。`,
+    pause: `暂停`,
+    paused: `已暂停`,
+    resume: `继续`,
+    stop: `停止`,
+    stopped: `已停止`,
+    buildingIdx: name => ` <span class="muted">· 正在建：${name}</span>`,
+    idxDone: ` <span class="muted">· 完成</span>`,
+    creatingIdx: (done, tot) => `创建索引 ${done}/${tot}`,
+    pauseStopHint: `暂停＝挂起可原地继续（不重迁）；停止＝结束任务，再启动会从头全量重迁并清空死信队列。`,
+    cutoverInitialDesc: `进入「增量追尾」后，这里会汇总所有集合，判断是否可以安全切换。`,
+    cutoverReadyPrefix: `切换就绪：`,
+    cutoverRedTitle: `禁止切换：仍有失败 / DLQ 未清零`,
+    cutoverRedStep: `先清空失败与死信队列（见下方明细），再考虑切换。`,
+    cutoverAmberTitle: `追赶中：尚未满足就绪条件`,
+    cutoverAmberStep: (lag, stable, minStreak) => `需 Lag ≤ ${lag}s 且连续 ${stable} 个健康周期（当前最小 ${minStreak}/${stable}）。`,
+    cutoverGreenTitle: `已就绪：可以安全切换`,
+    cutoverGreenStep: `切换步骤：① 停止源库写入 → ② 确认本卡保持绿灯且 Lag=空闲 → ③ 运行下方「验证迁移结果」比对计数 → ④ 应用切到 Firestore。`,
+    liveColls: n => `增量集合 ${n}`,
+    cumEvents: n => `累计事件 ${n}`,
+    failedLabel: `失败`,
+    maxLag: txt => `最大Lag ${txt}`,
+    minStable: (a, b) => `最小稳定 ${a}/${b}`,
+    idle: `空闲`,
+    dlqBanner: n => `⛔ 死信队列有 <b>${n}</b> 条未解决的失败文档，切换前必须清零。`,
+    viewDetails: `查看明细`,
+    collapseDetails: `收起明细`,
+    dlqPanelTitle: n => `死信队列明细（按源集合聚合）· 共 ${n} 条`,
+    dlqRetryNote: `直接在<b>源库</b>里修好下面这些文档（<b>保持 _id 不变</b>），增量复制会把修改当作 update 自动重放并写入目标，对应的死信记录会自动清除，无需停机或手动重试。`,
+    entriesCount: n => `· ${n} 条`,
+    showingFirst: n => ` <span class="muted">(仅显示前 ${n})</span>`,
+    thOp: `op`,
+    thError: `错误`,
+    thTime: `时间`,
+    noDocSnapshot: `(未保存文档快照)`,
+    resetJobRunning: `有任务正在运行，请先「停止」再重置。`,
+    resetConfirm: `重置会话将：\n· 清空修复计划（自动备份原文件）\n· 从看板移除已结束的任务及其行\n· 删除上次运行的残留文件（DLQ、断点、id 映射、审计日志）\n\n不会改动连接配置，也不会动云端 Firestore 数据。\n\n确定继续？`,
+    resetFailed: `重置失败：`,
+    resetDone: `会话已重置。\n`,
+    resetPlanCleared: `· 修复计划已清空`,
+    backedUpTo: p => `（已备份到 ${p}）`,
+    resetJobsPurged: n => `· 已移除 ${n} 个已结束任务\n`,
+    resetFilesRemoved: n => `· 删除残留文件 ${n} 个`,
+    phError: `错误`,
+    cannotStartRepl: `无法开始复制`,
+    phLiveStopped: `增量·已停`,
+    phLive: `增量`,
+    phInitial: `全量`,
+    events: `事件`,
+    docs: `文档`,
+    eventsStopped: n => `${n} 事件 · 已停`,
+    eventsTailing: n => `${n} 事件 · 追尾中`,
+    writtenCounting: n => `${n} 已写（统计中…）`,
+    rdyGreen: `就绪`,
+    rdyAmber: `追赶`,
+    rdyRed: `阻断`,
+    tipRed: (failed, dlq) => `失败 ${failed} / DLQ ${dlq}，必须清零`,
+    tipGreen: (streak, need) => `已连续 ${streak}/${need} 个健康周期`,
+    tipLagHigh: thr => `Lag 偏高（阈值 ${thr}s）`,
+    tipStabilizing: (streak, need) => `稳定中 ${streak}/${need}`,
+    noCollsInTab: `（此分类暂无集合）`,
+    prevPage: `‹ 上一页`,
+    nextPage: `下一页 ›`,
+    pagerInfo: (cur, pages, total, size) => `第 ${cur} / ${pages} 页 · 共 ${total} 个集合（每页 ${size}）`,
+    totalColls: n => `共 ${n} 个集合`,
+    connLost: `⚠ 连接中断，重试中…`,
+  },
+};
+let LANG;
+{
+  const saved = localStorage.getItem('lang');
+  LANG = (saved === 'en' || saved === 'zh') ? saved
+       : (String(navigator.language||'').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+}
+function t(key, ...args){
+  const v = (I18N[LANG]||{})[key];
+  if(v==null) return (I18N.en[key]!=null ? (typeof I18N.en[key]==='function'?I18N.en[key](...args):I18N.en[key]) : key);
+  return typeof v==='function' ? v(...args) : v;
+}
+// locText localizes a backend-originated string that ships as {key,args,fallback}:
+// render via i18n when a stable key is present, else fall back to the English
+// prose the backend also sent (findings detail / remediation note / straggler
+// reason). args is the DetailArgs/ReasonArgs array emitted by the Go side.
+// (Named locText, not loc — `loc` is already a local location-string var in the
+// assess renderers.)
+function locText(key, args, fallback){
+  return key ? t(key, ...(args||[])) : (fallback||"");
+}
+function applyI18n(){
+  document.title = t('appTitle');
+  document.documentElement.lang = LANG;
+  document.querySelectorAll('[data-i18n]').forEach(e => { e.textContent = t(e.getAttribute('data-i18n')); });
+  document.querySelectorAll('[data-i18n-html]').forEach(e => { e.innerHTML = t(e.getAttribute('data-i18n-html')); });
+  document.querySelectorAll('[data-i18n-ph]').forEach(e => { e.placeholder = t(e.getAttribute('data-i18n-ph')); });
+  document.querySelectorAll('[data-i18n-title]').forEach(e => { e.title = t(e.getAttribute('data-i18n-title')); });
+}
+function setLang(l){
+  LANG = (l === 'zh') ? 'zh' : 'en';
+  try { localStorage.setItem('lang', LANG); } catch(e){}
+  document.querySelectorAll('#langToggle button').forEach(b => b.classList.toggle('active', b.dataset.lang === LANG));
+  applyI18n();
+  // Restore idle button labels that JS otherwise owns (skip if mid-operation).
+  ['detectBtn','assessBtn','startBtn','verifyBtn'].forEach(id => { const b = el(id); if(b && !b.disabled) b.textContent = t(id); });
+  // Repaint already-rendered dynamic views in the new language.
+  if(typeof LAST_ST !== 'undefined' && LAST_ST) render(LAST_ST);
+  if(typeof LAST_REPORT !== 'undefined' && LAST_REPORT !== null) renderAssess(LAST_REPORT, LAST_TUNING);
+  if(typeof renderDlqBanner === 'function') renderDlqBanner();
+  if(typeof renderDlqPanel === 'function') renderDlqPanel();
+}
+
+let DETECT = null;          // last /api/detect response
+let FIRES = [];             // Firestore databases from /api/firestore/databases
+let FIRES_LOADED = false;
+let LOCS = [];              // single-region Firestore locations from /api/firestore/locations
+let LOCS_LOADED = false;
+const MAPPING = {};         // sourceDB -> {endpoint, dbID}
+
+function el(id){ return document.getElementById(id); }
+function show(id){ el(id).classList.remove("hidden"); }
+// Show the full-only caveat only when 全量迁移 (migrate) is selected: it is a
+// one-shot copy that does NOT capture writes made during/after the scan.
+function onModeChange(){
+  const el2 = el("modeWarn");
+  if(!el2) return;
+  const m = document.querySelector('input[name=mode]:checked');
+  el2.classList.toggle("hidden", !(m && m.value === "migrate"));
+}
+function hide(id){ el(id).classList.add("hidden"); }
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+// trunc shortens a long string for display (full text stays available on expand).
+function trunc(s, n){ s = s==null ? "" : String(s); return s.length>n ? s.slice(0,n)+"…" : s; }
+
+async function postJSON(url, body){
+  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  let data = {}; try { data = await r.json(); } catch(e){}
+  if(!r.ok) throw new Error(data.error || ("HTTP "+r.status));
+  return data;
+}
+async function getJSON(url){
+  const r = await fetch(url);
+  let data = {}; try { data = await r.json(); } catch(e){}
+  if(!r.ok) throw new Error(data.error || ("HTTP "+r.status));
+  return data;
+}
+
+/* ---------- Step 1: detect ---------- */
+async function detect(){
+  el("detectErr").innerHTML = ""; el("detectResult").innerHTML = "";
+  const btn = el("detectBtn"); btn.disabled = true; btn.textContent = t("detectBtnBusy");
+  try {
+    const d = await postJSON("/api/detect", {source: el("source").value.trim()});
+    DETECT = d;
+    const method = d.replicationMethod;
+    let html = `<div style="margin-top:.6rem">`
+      + `<span class="pill pill-info">${esc(t("pillVersion", d.version||"?"))}</span>`
+      + `<span class="pill ${d.isReplicaSet?"pill-ok":"pill-warn"}">${esc(t("pillReplicaSet", d.isReplicaSet))}</span>`
+      + `<span class="pill pill-info">${esc(t("pillDriver", d.modernDriver?"modern":"legacy(mgo)"))}</span>`
+      + `<span class="pill ${method==="oplog-legacy"?"pill-warn":"pill-ok"}">${esc(t("pillReplMethod", method))}</span></div>`;
+    if(d.warning) html += `<div class="err" style="background:#3a2f14;border-color:#7c5e12;color:#fbbf24">${esc(d.warning)}</div>`;
+    if(d.planReset){
+      // The server detected this is a DIFFERENT source than the one the previous
+      // remediation plan was built for, and cleared it. Wipe any client-side
+      // leftovers (pending fixes + last assessment render) so nothing stale shows.
+      if(typeof PENDING !== "undefined" && PENDING && PENDING.clear) PENDING.clear();
+      const ar = el("assessResult"); if(ar) ar.innerHTML = "";
+      html += `<div class="err ok" style="background:#0f2418;border-color:#14532d;color:#86efac;margin-top:.5rem">`
+        + t("planResetMsg")
+        + (d.planBackup?t("planBackupNote", esc(d.planBackup)):``)
+        + `</div>`;
+    }
+    el("detectResult").innerHTML = html;
+    renderDatabases(d);
+    show("selCard"); show("targetCard"); show("assessCard"); show("modeCard"); onModeChange();
+    refreshMapping();
+    if(!FIRES_LOADED) loadFirestore();
+  } catch(e){
+    el("detectErr").innerHTML = `<div class="err">${esc(t("detectFailed", e.message))}</div>`;
+  } finally { btn.disabled = false; btn.textContent = t("detectBtn"); }
+}
+
+/* ---------- Step 2: db/collection selection ---------- */
+function renderDatabases(d){
+  const host = el("dbList"); host.innerHTML = "";
+  if(d.inventoryError || !d.databases){
+    host.innerHTML = `<div class="muted">${esc(t("inventoryFailed", d.inventoryError||t("noInventory")))}</div>`
+      + `<label>${esc(t("manualDbLabel"))}</label><input type="text" id="manualDB" placeholder="valtest" oninput="refreshMapping()">`
+      + `<label>${esc(t("manualCollsLabel"))}</label><input type="text" id="manualColls" placeholder="${esc(t("manualCollsPh"))}">`;
+    host.dataset.mode = "manual";
+    return;
+  }
+  host.dataset.mode = "inventory";
+  const dbs = Object.keys(d.databases).sort();
+  if(dbs.length === 0){ host.innerHTML = `<div class="muted">${esc(t("noUserDbs"))}</div>`; return; }
+  dbs.forEach(dbn => {
+    const colls = d.databases[dbn] || [];
+    const det = document.createElement("details");
+    det.className = "dbgroup"; det.open = (dbs.length === 1); det.dataset.db = dbn;
+    let inner = `<summary><label style="display:inline-flex;gap:.4rem;margin:0">`
+      + `<input type="checkbox" class="dbchk" onchange="toggleDB(this)"> <b>${esc(dbn)}</b> <span class="muted">${esc(t("collCount", colls.length))}</span></label></summary>`;
+    inner += `<div class="colls">`;
+    colls.forEach(c => { inner += `<label><input type="checkbox" class="collchk" value="${esc(c)}" onchange="refreshMapping()"> ${esc(c)}</label>`; });
+    inner += `</div>`;
+    det.innerHTML = inner;
+    host.appendChild(det);
+  });
+}
+function toggleDB(chk){
+  chk.closest("details").querySelectorAll(".collchk").forEach(c => c.checked = chk.checked);
+  refreshMapping();
+}
+function selectedDatabases(){
+  const host = el("dbList");
+  if(host.dataset.mode === "manual"){
+    const dbn = (el("manualDB") && el("manualDB").value || "").trim();
+    return dbn ? [dbn] : [];
+  }
+  const out = [];
+  host.querySelectorAll("details.dbgroup").forEach(group => {
+    if([...group.querySelectorAll(".collchk")].some(c => c.checked)) out.push(group.dataset.db);
+  });
+  return out;
+}
+function gatherSelections(){
+  const host = el("dbList");
+  if(host.dataset.mode === "manual"){
+    const dbn = (el("manualDB").value||"").trim();
+    if(!dbn) return [];
+    const raw = (el("manualColls").value||"").trim();
+    const colls = raw ? raw.split(",").map(s=>s.trim()).filter(Boolean) : [];
+    return [{database: dbn, allCollections: colls.length===0, collections: colls}];
+  }
+  const sels = [];
+  host.querySelectorAll("details.dbgroup").forEach(group => {
+    const all = group.querySelectorAll(".collchk");
+    const checked = [...all].filter(c => c.checked).map(c => c.value);
+    if(checked.length === 0) return;
+    sels.push({database: group.dataset.db, allCollections: checked.length === all.length, collections: checked});
+  });
+  return sels;
+}
+
+/* ---------- Step 3: Firestore list + mapping ---------- */
+async function loadFirestore(){
+  el("fireHint").textContent = t("loading");
+  try {
+    const d = await getJSON("/api/firestore/databases");
+    FIRES = d.databases || []; FIRES_LOADED = true;
+    const compat = FIRES.filter(x=>x.mongoCompatible).length;
+    el("fireHint").innerHTML = esc(t("fireHintCount", FIRES.length, compat));
+  } catch(e){
+    el("fireHint").innerHTML = `<span style="color:#fca5a5">${esc(t("loadFailedText", e.message))}</span>`;
+  }
+}
+
+function refreshMapping(){
+  const dbs = selectedDatabases();
+  const rows = el("mapRows");
+  el("mapEmpty").classList.toggle("hidden", dbs.length > 0);
+  rows.innerHTML = "";
+  dbs.forEach(dbn => {
+    const cur = MAPPING[dbn];
+    const tr = document.createElement("tr");
+    tr.dataset.db = dbn;
+    tr.innerHTML =
+      `<td><code>${esc(dbn)}</code></td>` +
+      `<td class="arrow">→</td>` +
+      `<td><div class="combo">` +
+        `<input type="text" class="mapInput" id="mi-${cssid(dbn)}" placeholder="${esc(t("mapInputPh"))}" autocomplete="off" ` +
+          `value="${cur?esc(cur.dbID):""}" oninput="onComboInput('${jsstr(dbn)}')" onfocus="openCombo('${jsstr(dbn)}')" onblur="closeCombo('${jsstr(dbn)}')">` +
+        `<div class="dropdown hidden" id="dd-${cssid(dbn)}"></div>` +
+        `<div class="mapStatus muted" id="st-${cssid(dbn)}">${cur?statusText(cur):""}</div>` +
+      `</div></td>`;
+    rows.appendChild(tr);
+  });
+}
+function statusText(cur){ return t("statusTarget", esc(cur.dbID), esc(cur.endpoint)); }
+function cssid(s){ return s.replace(/[^a-zA-Z0-9_-]/g,"_"); }
+function jsstr(s){ return s.replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
+
+function openCombo(dbn){ renderDropdown(dbn, (el("mi-"+cssid(dbn)).value||"").trim()); el("dd-"+cssid(dbn)).classList.remove("hidden"); }
+function closeCombo(dbn){ setTimeout(()=>{ const dd=el("dd-"+cssid(dbn)); if(dd) dd.classList.add("hidden"); }, 200); }
+function onComboInput(dbn){ renderDropdown(dbn, (el("mi-"+cssid(dbn)).value||"").trim()); el("dd-"+cssid(dbn)).classList.remove("hidden"); }
+
+function renderDropdown(dbn, q){
+  const dd = el("dd-"+cssid(dbn)); if(!dd) return;
+  const ql = q.toLowerCase();
+  const compat = FIRES.filter(x=>x.mongoCompatible);
+  const matches = compat.filter(x => x.id.toLowerCase().includes(ql));
+  let html = "";
+  const exact = FIRES.some(x => x.id === q);
+  if(q && !exact && validDBID(q)){
+    html += `<div class="ditem create" onmousedown="createTarget('${jsstr(dbn)}','${jsstr(q)}')">${t("createFsItem", esc(q))}</div>`;
+  } else if(q && !exact && !validDBID(q)){
+    html += `<div class="ditem disabled">${esc(t("invalidName"))}</div>`;
+  }
+  if(matches.length === 0 && !html){
+    html += `<div class="ditem disabled">${esc(t("noMatchCompat"))}${FIRES_LOADED?"":esc(t("clickRefreshHint"))}</div>`;
+  }
+  matches.forEach(x => {
+    html += `<div class="ditem" onmousedown="pickTarget('${jsstr(dbn)}','${jsstr(x.id)}')">`
+      + `<code>${esc(x.id)}</code><span class="tag">${esc(x.location)} · ${esc(x.edition)}</span></div>`;
+  });
+  // also show incompatible (disabled) for transparency
+  const incompat = FIRES.filter(x=>!x.mongoCompatible && x.id.toLowerCase().includes(ql));
+  incompat.forEach(x => {
+    html += `<div class="ditem disabled"><code>${esc(x.id)}</code><span class="tag">${esc(t("incompatTag", x.edition))}</span></div>`;
+  });
+  dd.innerHTML = html;
+}
+function validDBID(s){ return /^[a-z][a-z0-9-]{2,61}[a-z0-9]$/.test(s); }
+
+function pickTarget(dbn, id){
+  const x = FIRES.find(f => f.id === id); if(!x) return;
+  MAPPING[dbn] = {endpoint: x.endpoint, dbID: x.id};
+  el("mi-"+cssid(dbn)).value = x.id;
+  el("st-"+cssid(dbn)).innerHTML = statusText(MAPPING[dbn]);
+  el("dd-"+cssid(dbn)).classList.add("hidden");
+}
+async function loadLocations(){
+  if(LOCS_LOADED) return;
+  try {
+    const d = await getJSON("/api/firestore/locations");
+    LOCS = d.locations || []; LOCS_LOADED = true;
+  } catch(e){ LOCS = []; }
+}
+
+// createTarget opens a modal to collect the fixed-but-varying create options
+// (region, PITR, backup schedule). Edition=enterprise + MongoDB compatibility
+// are implied and not shown.
+async function createTarget(dbn, id){
+  el("dd-"+cssid(dbn)).classList.add("hidden");
+  await loadLocations();
+  const def = "asia-northeast1";
+  const opts = LOCS.length ? LOCS : [def];
+  const locHtml = opts.map(l =>
+    `<option value="${esc(l)}"${l===def?" selected":""}>${esc(l)}</option>`).join("");
+  el("cmBody").innerHTML =
+    `<p class="muted">${t("willCreateFs", esc(id))}</p>` +
+    `<label class="fld">${esc(t("locationLabel"))}` +
+      `<select id="cmLoc">${locHtml}</select></label>` +
+    `<label class="fld chk"><input type="checkbox" id="cmPitr"> ${esc(t("pitrLabel"))}</label>` +
+    `<label class="fld">${esc(t("backupLabel"))}` +
+      `<select id="cmBackup">` +
+        `<option value="none" selected>${esc(t("backupNone"))}</option>` +
+        `<option value="daily">${esc(t("backupDaily"))}</option>` +
+        `<option value="weekly">${esc(t("backupWeekly"))}</option>` +
+      `</select></label>` +
+    `<p class="muted" style="margin-top:.6rem">${esc(t("createBillWarn"))}</p>` +
+    `<div id="cmErr" style="color:#fca5a5"></div>`;
+  el("cmCreate").onclick = () => submitCreate(dbn, id);
+  el("cmCreate").disabled = false;
+  el("cmCreate").textContent = t("createBtn");
+  el("modal").classList.remove("hidden");
+}
+
+function closeModal(){ el("modal").classList.add("hidden"); }
+
+async function submitCreate(dbn, id){
+  const body = {
+    id,
+    location: el("cmLoc").value,
+    enablePitr: el("cmPitr").checked,
+    backupSchedule: el("cmBackup").value,
+  };
+  el("cmErr").textContent = "";
+  el("cmCreate").disabled = true;
+  el("cmCreate").textContent = t("createBtnBusy");
+  const st = el("st-"+cssid(dbn));
+  st.innerHTML = t("creatingTarget", esc(id));
+  try {
+    const x = await postJSON("/api/firestore/create", body);
+    FIRES.push(x);
+    MAPPING[dbn] = {endpoint: x.endpoint, dbID: x.id};
+    el("mi-"+cssid(dbn)).value = x.id;
+    let note = t("createdNote");
+    if(x.warning) note += ` <span style="color:#fbbf24">⚠ ${esc(x.warning)}</span>`;
+    st.innerHTML = statusText(MAPPING[dbn]) + note;
+    closeModal();
+  } catch(e){
+    el("cmErr").textContent = t("createFailedPrefix") + e.message;
+    el("cmCreate").disabled = false;
+    el("cmCreate").textContent = t("retryCreateBtn");
+    st.innerHTML = `<span style="color:#fca5a5">${esc(t("createFailedPrefix") + e.message)}</span>`;
+  }
+}
+
+function toggleAuth(){
+  const scram = document.querySelector('input[name=auth]:checked').value === "scram";
+  el("scramFields").classList.toggle("hidden", !scram);
+}
+
+/* ---------- shared request body ---------- */
+// buildBaseBody assembles the source/auth/selections payload shared by start,
+// assess and verify. When withTarget is true it also attaches each source db's
+// Firestore target (required for start/verify; optional for assess).
+function buildBaseBody(withTarget){
+  const sels = gatherSelections();
+  const auth = document.querySelector('input[name=auth]:checked').value;
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  return {
+    source: el("source").value.trim(),
+    replicationMethod: DETECT ? DETECT.replicationMethod : "",
+    mode: mode,
+    auth: { type: auth, user: el("scramUser")?el("scramUser").value:"", pass: el("scramPass")?el("scramPass").value:"" },
+    selections: sels.map(s => {
+      const o = { database: s.database, allCollections: s.allCollections, collections: s.collections };
+      const m = MAPPING[s.database];
+      if(withTarget && m){ o.targetEndpoint = m.endpoint; o.targetDBID = m.dbID; }
+      if(COLL_TUNING[s.database] && Object.keys(COLL_TUNING[s.database]).length){
+        o.collectionTuning = COLL_TUNING[s.database]; // per-collection partition overrides
+      }
+      return o;
+    })
+  };
+}
+
+// readTuning collects the advanced concurrency inputs. Blank numeric fields are
+// omitted (0), letting the server fall back to engine defaults.
+function readTuning(){
+  const num = id => { const v = parseInt(el(id).value, 10); return isNaN(v)||v<0 ? 0 : v; };
+  return {
+    initialMigrationWorkers: num("tInitWorkers"),
+    concurrentCollections:   num("tConcColl"),
+    incrementalWorkerCount:  num("tIncWorkers"),
+    parallelReadsEnabled:    el("tParallel").checked,
+    maxReadPartitions:       num("tMaxParts"),
+    workersPerPartition:     num("tWorkersPerPart"),
+    minDocsPerPartition:     num("tMinDocsPerPart"),
+    minDocsForParallelReads: num("tMinDocsParallel"),
+  };
+}
+
+/* ---------- Step 4: assessment ---------- */
+// readSample collects the sampling knobs. Blank fields are omitted (0), letting
+// the server fall back to assess.DefaultSampleConfig (floor 1000, 0.1%, cap 50000).
+function readSample(){
+  const num = id => { const v = parseInt(el(id).value, 10); return isNaN(v)||v<0 ? 0 : v; };
+  const flt = id => { const v = parseFloat(el(id).value); return isNaN(v)||v<0 ? 0 : v; };
+  return { floor: num("sFloor"), ratePct: flt("sRate"), cap: num("sCap") };
+}
+
+async function runAssess(){
+  PENDING.clear(); // a real scan supersedes any queued-but-not-yet-detected changes
+  COLL_TUNING = {}; // a fresh scan re-seeds per-collection overrides from new recommendations
+  el("assessResult").innerHTML = "";
+  const sels = gatherSelections();
+  if(sels.length === 0){ el("assessResult").innerHTML = `<div class="err">${esc(t("assessNoSel"))}</div>`; return; }
+  const btn = el("assessBtn"); btn.disabled = true; btn.textContent = t("assessBtnBusy");
+  try {
+    const body = buildBaseBody(true); body.sample = readSample();
+    const d = await postJSON("/api/assess", body);
+    renderAssess(d.report, d.tuning);
+    if(d.tuning) applyRecommendedTuning(d.tuning);
+  } catch(e){
+    el("assessResult").innerHTML = `<div class="err">${esc(t("assessFailed", e.message))}</div>`;
+  } finally { btn.disabled = false; btn.textContent = t("assessBtn"); }
+}
+
+// FIXABLE maps an assess rule to its migration-time workaround note (mirrors
+// remediate.DefaultStrategy on the server). A rule absent here has no auto-fix.
+// Each value is an I18N key; the localized note is resolved via t() at render time.
+const FIXABLE = {
+  "collection-name-reserved": "fixable_collNameReserved",
+  "id-reserved":              "fixable_idReserved",
+  "nesting-depth":            "fixable_nestingDepth",
+  "field-path-length":        "fixable_fieldPathLength",
+  "field-name-length":        "fixable_fieldNameLength",
+  "field-name-reserved":      "fixable_fieldNameReserved",
+  "value-size":              "fixable_valueSize",
+};
+// FIX_ARGS backs the fix buttons: each button carries an index into this array so
+// collection/rule names never need HTML/JS escaping in the onclick attribute.
+// Every fix is scoped to ONE collection and only applied when the operator clicks
+// its button — there is deliberately no bulk / whole-database apply.
+let FIX_ARGS = [];
+
+// Clicking 应用修复/撤销 only REGISTERS the change in the migration plan (a cheap
+// POST) and re-renders locally from LAST_REPORT — it does NOT re-scan. The
+// operator queues as many fixes as they like, then clicks 重新检测 once to run a
+// single re-assessment that applies the whole plan in-memory and shows what
+// remains. PENDING tracks changes registered since the last real scan, keyed
+// "rule|db|coll", so rows can show 已登记…待检测 and offer 取消/恢复.
+let LAST_REPORT = null, LAST_TUNING = null;
+const PENDING = new Map();
+function fixKey(a){ return a.rule + "|" + (a.database||"") + "|" + (a.collection||""); }
+
+// COLL_TUNING holds per-collection partition overrides the operator will send
+// with 开始迁移, keyed COLL_TUNING[db][coll] = {parallelReadsEnabled, maxReadPartitions,
+// workersPerPartition, minDocsPerPartition, minDocsForParallelReads}. It is seeded
+// from the assessment's straggler recommendations and edited in place; a fresh
+// scan (runAssess) resets it. STRAGGLERS indexes the rendered rows so onchange
+// handlers can reference a collection without escaping names into attributes.
+let COLL_TUNING = {};
+let STRAGGLERS = [];
+function ensureCT(db, coll, ov){
+  if(!COLL_TUNING[db]) COLL_TUNING[db] = {};
+  if(!COLL_TUNING[db][coll]) COLL_TUNING[db][coll] = Object.assign({}, ov||{});
+  return COLL_TUNING[db][coll];
+}
+function ctSet(i, field, value){
+  const s = STRAGGLERS[i]; if(!s) return;
+  const t = COLL_TUNING[s.db] && COLL_TUNING[s.db][s.coll]; if(!t) return;
+  if(field === 'parallelReadsEnabled'){ t[field] = value; return; }
+  const v = parseInt(value, 10); t[field] = isNaN(v)||v<0 ? 0 : v;
+}
+// renderStragglers renders the ⚠ per-collection override editor from the report's
+// straggler recommendations, seeding COLL_TUNING for rows not yet edited.
+function renderStragglers(recs){
+  STRAGGLERS = [];
+  let h = `<div class="straggler"><div class="straggler-h">${esc(t("stragglerHeader", recs.length))}</div>`
+    + `<div class="muted" style="margin-bottom:.4rem">${esc(t("stragglerDesc"))}</div>`;
+  recs.forEach(rec => {
+    const i = STRAGGLERS.length;
+    STRAGGLERS.push({db: rec.database, coll: rec.collection});
+    const ov = ensureCT(rec.database, rec.collection, rec.override || {});
+    const en = ov.parallelReadsEnabled !== false;
+    h += `<div class="straggler-row"><div class="straggler-name"><b>${esc(rec.database)}.${esc(rec.collection)}</b>`
+      + `<span class="muted"> · ${esc(locText(rec.reasonKey, rec.reasonArgs, rec.reason))}</span></div>`
+      + `<div class="tunegrid">`
+      + `<label class="chk"><input type="checkbox" ${en?"checked":""} onchange="ctSet(${i},'parallelReadsEnabled',this.checked)"> ${esc(t("enableParallelPart"))}</label>`
+      + `<label>${esc(t("partitions"))}<input type="number" min="1" value="${ov.maxReadPartitions||""}" onchange="ctSet(${i},'maxReadPartitions',this.value)"></label>`
+      + `<label>${esc(t("workersPerPart"))}<input type="number" min="1" value="${ov.workersPerPartition||""}" onchange="ctSet(${i},'workersPerPartition',this.value)"></label>`
+      + `<label>${esc(t("minDocsPerPart"))}<input type="number" min="1" value="${ov.minDocsPerPartition||""}" onchange="ctSet(${i},'minDocsPerPartition',this.value)"></label>`
+      + `<label>${esc(t("triggerThreshold"))}<input type="number" min="1" value="${ov.minDocsForParallelReads||""}" onchange="ctSet(${i},'minDocsForParallelReads',this.value)"></label>`
+      + `</div></div>`;
+  });
+  return h + `</div>`;
+}
+
+function renderAssess(rep, tuning){
+  FIX_ARGS = [];
+  LAST_REPORT = rep; LAST_TUNING = tuning;
+  rep = rep || {}; const counts = rep.counts || {};
+  const b = counts.B||0, a = counts.A||0, c = counts.C||0;
+  const total = rep.totalDocs||0, insp = rep.docsInspected||0;
+  const pct = total>0 ? insp/total*100 : 0;
+  const sc = rep.sample||{};
+  const fmtPct = x => x>=1 ? x.toFixed(1) : (+x.toPrecision(2)).toString();
+  let html = `<div style="margin-top:.6rem">`
+    + `<span class="pill pill-info">${esc(t("pillDbColl", rep.databases||0, rep.collections||0))}</span>`
+    + `<span class="pill pill-info">${esc(t("pillDocs", total.toLocaleString(), insp.toLocaleString(), fmtPct(pct)))}</span>`
+    + `<span class="pill pill-info">${esc(t("pillStrategy", sc.floor||0, fmtPct((sc.rate||0)*100), (sc.cap||0).toLocaleString()))}</span>`
+    + `<span class="pill ${b?"pill-warn":"pill-ok"}">${esc(t("pillBlock", b))}</span>`
+    + `<span class="pill pill-info">${esc(t("pillAutoFix", a))}</span>`
+    + `<span class="pill pill-warn">${esc(t("pillWarn", c))}</span></div>`;
+  if(b>0){ html += `<div class="err">${esc(t("blockingMsg", b))}</div>`; }
+  else { html += `<div style="margin-top:.5rem" class="ok">${esc(t("noBlockingMsg"))}</div>`; }
+
+  // Pending-changes banner: fixes are only registered, not yet re-detected. This
+  // is the one place the operator triggers the single unified re-scan.
+  if(PENDING.size){
+    html += `<div class="pendbar"><span class="grow">${t("pendbarText", PENDING.size)}</span>`
+      + `<button class="btn-fix" onclick="reDetect()">${esc(t("reDetectBtn", PENDING.size))}</button></div>`;
+  }
+
+  // Index budget: per target database, fully scanned (never sampled) because
+  // Firestore caps indexes per database and _id needs an explicit extra index.
+  const ix = rep.indexes || [];
+  if(ix.length){
+    html += `<div style="margin-top:.8rem">${t("indexBudget", (ix[0].limit||1000).toLocaleString())}</div>`
+      + `<table style="margin-top:.4rem"><thead><tr><th>${esc(t("thTargetDb"))}</th><th>${esc(t("thSecIdx"))}</th><th>${esc(t("thIdIdx"))}</th><th>${esc(t("thTotal"))}</th><th>${esc(t("thHeadroom"))}</th></tr></thead><tbody>`;
+    ix.forEach(x => {
+      const over = x.total > x.limit, near = !over && x.total > x.limit*0.9;
+      const cls = over ? "sev-B" : (near ? "sev-C" : "");
+      const headroom = x.limit - x.total;
+      html += `<tr><td>${esc(x.database)}</td><td>${(x.secondary||0).toLocaleString()}</td>`
+        + `<td>+${(x.idIndexes||0).toLocaleString()}</td>`
+        + `<td><span class="sev ${cls}">${(x.total||0).toLocaleString()} / ${(x.limit||0).toLocaleString()}</span></td>`
+        + `<td>${over?`<span class="err" style="padding:0">${esc(t("overBy", (-headroom).toLocaleString()))}</span>`:headroom.toLocaleString()}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+  }
+
+  // Fixes the operator has CHOSEN (not applied — source is never touched here;
+  // the transform only runs at migration write-time). Findings covered by a
+  // chosen fix no longer appear in the problem list below, so we echo them here
+  // as "已选择修复" with a "不修复了" (deselect) button. Nothing is undone on the
+  // source; deselecting just removes it from the migration plan.
+  const rems = rep.remediations || [];
+  if(rems.length){
+    html += `<div style="margin-top:.8rem">${t("chosenFixesTitle")}</div>`
+      + `<div class="muted" style="margin:.2rem 0 .4rem">${t("auditNote")}</div>`
+      + `<table style="margin-top:.4rem"><thead><tr><th>${esc(t("thRule"))}</th><th>${esc(t("thLocation"))}</th><th>${esc(t("thFixPlan"))}</th><th>${esc(t("thAction"))}</th></tr></thead><tbody>`;
+    rems.forEach((rm, i) => {
+      const loc = [rm.database, rm.collection].filter(Boolean).join(".");
+      const args = {rule:rm.rule, database:rm.database, collection:rm.collection};
+      FIX_ARGS.push(args);
+      const idx = FIX_ARGS.length - 1;
+      const pendRevert = PENDING.get(fixKey(args))?.action === "revert";
+      const mark = pendRevert ? "○" : "☑";
+      const op = pendRevert
+        ? `<span class="queued warn">${esc(t("cancelledPending"))}</span> <span class="smplink" onclick="restoreFix(${idx})">${esc(t("reselectFix"))}</span>`
+        : `<button class="secondary" onclick="revertFix(${idx})">${esc(t("dontFixBtn"))}</button>`;
+      html += `<tr><td>${mark} <code>${esc(rm.rule)}</code></td><td>${esc(loc||"-")}</td>`
+        + `<td class="muted">${esc(locText(rm.noteKey, null, rm.note))}</td>`
+        + `<td>${op}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+  }
+
+  // Problems that block / affect migration, aggregated one row per (集合, 规则).
+  // Each row expands to show a few concrete offending documents (样例) so the
+  // operator can eyeball the real data before deciding — per collection — whether
+  // to click 应用修复. No fix is ever applied automatically or in bulk.
+  const fs = rep.findings || [];
+  if(fs.length){
+    html += `<div style="margin-top:.8rem">${t("problemsTitle")}</div>`
+      + `<div class="muted" style="margin:.2rem 0 .4rem">${t("problemsDesc")}</div>`
+      + `<table class="findtbl" style="margin-top:.4rem">`
+      + `<colgroup><col style="width:52px"><col style="width:150px"><col style="width:180px"><col style="width:66px"><col><col style="width:230px"></colgroup>`
+      + `<thead><tr><th>${esc(t("thSeverity"))}</th><th>${esc(t("thRule"))}</th><th>${esc(t("thLocation"))}</th><th>${esc(t("thHits"))}</th><th>${esc(t("thProblem"))}</th><th>${esc(t("thFixAction"))}</th></tr></thead><tbody>`;
+    fs.forEach((f, i) => {
+      const loc = [f.database, f.collection].filter(Boolean).join(".");
+      const note = FIXABLE[f.rule];
+      let fix;
+      if(f.severity === "A"){
+        // A 类 = 迁移器写入时自动处理（类型转换记入 id-map、字段名自动重写等），
+        // 用户无需任何操作。绝不能显示"无自动修复/需人工处理"。
+        fix = `<span class="autofix">${t("autoFixNote")}</span>`;
+      } else if(note){
+        const args = {rule:f.rule, database:f.database||"", collection:f.collection||""};
+        FIX_ARGS.push(args);
+        const idx = FIX_ARGS.length - 1;
+        const pendApply = PENDING.get(fixKey(args))?.action === "apply";
+        fix = `<div class="fixnote">${esc(t(note))}</div>`
+          + (pendApply
+              ? `<span class="queued">${esc(t("fixSelected"))}</span> <span class="smplink" onclick="cancelFix(${idx})">${esc(t("dontFix"))}</span>`
+              : `<button class="btn-fix" onclick="applyFix(${idx})">${esc(t("selectFix"))}</button>`);
+      } else {
+        // B/C 类且没有可登记的自动转换方案 → 只能人工处理源数据。
+        fix = `<span class="muted">${t("noAutoFix")}</span>`;
+      }
+      const samples = f.samples || [];
+      const fid = "fsmp"+i;
+      let desc = `<span class="clip">${esc(trunc(locText(f.detailKey, f.detailArgs, f.detail), 120))}</span>`;
+      if(samples.length){
+        desc += `<span class="smplink" onclick="toggleSamples('${fid}')">${esc(t("expandSamples", samples.length))}</span>`;
+      }
+      const cnt = f.count ? `<span class="cnt">${f.count.toLocaleString()}</span>` : `<span class="muted">-</span>`;
+      html += `<tr><td><span class="sev sev-${esc(f.severity)}">${esc(f.severity)}</span></td>`
+        + `<td><code class="clip">${esc(f.rule)}</code></td>`
+        + `<td><span class="clip">${esc(loc||"-")}</span></td><td>${cnt}</td><td>${desc}</td>`
+        + `<td>${fix}</td></tr>`;
+      if(samples.length){
+        let stbl = `<div class="muted" style="margin:.1rem 0 .3rem">${esc(t("sampleDocsNote"))}</div>`
+          + `<table class="subtbl"><colgroup><col style="width:220px"><col></colgroup>`
+          + `<thead><tr><th>${esc(t("thDocId"))}</th><th>${esc(t("thProblemDetail"))}</th></tr></thead><tbody>`;
+        samples.forEach(s => {
+          stbl += `<tr><td><code class="clip">${esc(trunc(s.docId, 80))}</code></td>`
+            + `<td><span class="clip mono">${esc(trunc(locText(s.detailKey, s.detailArgs, s.detail), 240))}</span></td></tr>`;
+        });
+        stbl += `</tbody></table>`;
+        html += `<tr id="${fid}" class="hidden"><td></td><td colspan="5">${stbl}</td></tr>`;
+      }
+    });
+    html += `</tbody></table>`;
+  }
+
+  if(tuning){
+    html += `<div style="margin-top:.8rem">${t("recommendedTuning")}`
+      + `<span class="pill pill-info">${esc(t("pillFullWorker", tuning.initialMigrationWorkers))}</span>`
+      + `<span class="pill pill-info">${esc(t("pillConcColl", tuning.concurrentCollections))}</span>`
+      + `<span class="pill pill-info">${esc(t("pillIncWorker", tuning.incrementalWorkerCount))}</span>`
+      + `<span class="pill pill-info">${esc(t("pillParallel", tuning.enableParallelReads, tuning.maxReadPartitions, tuning.workersPerPartition))}</span>`
+      + `<span class="pill pill-info">${esc(t("pillPartThreshold", tuning.minDocsForParallelReads, tuning.minDocsPerPartition))}</span>`
+      + `<span class="pill pill-info">CPU ${tuning.numCPU}</span></div>`;
+    if(tuning.rationale && tuning.rationale.length){
+      html += `<ul class="ratio">` + tuning.rationale.map(x=>`<li>${esc(t(x))}</li>`).join("") + `</ul>`;
+    }
+  }
+  if(rep.collectionTuning && rep.collectionTuning.length){
+    html += renderStragglers(rep.collectionTuning);
+  }
+  el("assessResult").innerHTML = html;
+}
+
+// Each of these only REGISTERS/removes a migration-time transform in the plan (a
+// cheap POST) and re-renders locally from LAST_REPORT — NO re-scan. The single
+// re-scan happens later, once, when the operator clicks 重新检测 (reDetect).
+//   applyFix   — queue a fix for a finding            → PENDING[key] = apply
+//   revertFix  — queue removal of an applied fix      → PENDING[key] = revert
+//   cancelFix  — undo a queued apply (back to finding)→ PENDING deletes key
+//   restoreFix — undo a queued revert (keep the fix)  → PENDING deletes key
+async function applyFix(idx){ await queueChange("apply", idx, false); }
+async function revertFix(idx){ await queueChange("revert", idx, false); }
+async function cancelFix(idx){ await queueChange("revert", idx, true); }
+async function restoreFix(idx){ await queueChange("apply", idx, true); }
+// toggleSamples shows/hides the sample-offenders sub-row under a finding.
+function toggleSamples(id){ const r = el(id); if(r) r.classList.toggle("hidden"); }
+
+async function queueChange(action, idx, isUndo){
+  const a = FIX_ARGS[idx]; if(!a) return;
+  const key = fixKey(a);
+  try {
+    await postJSON("/api/remediate", {action, rule:a.rule, database:a.database, collection:a.collection});
+    if(isUndo) PENDING.delete(key);       // return to the pre-queue baseline state
+    else PENDING.set(key, {action, args:a});
+    rerenderAssess();                      // instant local feedback, no server scan
+  } catch(e){
+    alert(t("registerFailed") + e.message);
+  }
+}
+
+// reDetect runs the ONE unified re-assessment: it re-scans with the whole
+// registered plan applied in-memory (source untouched) and shows what remains.
+async function reDetect(){ await runAssess(); }
+// rerenderAssess repaints from the cached last report + PENDING overlay only.
+function rerenderAssess(){ if(LAST_REPORT !== null) renderAssess(LAST_REPORT, LAST_TUNING); }
+
+// applyRecommendedTuning pre-fills the advanced inputs with the recommendation.
+function applyRecommendedTuning(tn){
+  el("tInitWorkers").value = tn.initialMigrationWorkers || "";
+  el("tConcColl").value    = tn.concurrentCollections || "";
+  el("tIncWorkers").value  = tn.incrementalWorkerCount || "";
+  el("tParallel").checked  = !!tn.enableParallelReads;
+  el("tMaxParts").value    = tn.maxReadPartitions || "";
+  el("tWorkersPerPart").value  = tn.workersPerPartition || "";
+  el("tMinDocsPerPart").value  = tn.minDocsPerPartition || "";
+  el("tMinDocsParallel").value = tn.minDocsForParallelReads || "";
+  el("tuneSrc").textContent = t("tunePrefilledNote");
+  el("tuneDetails").open = true;
+}
+
+/* ---------- Step 5: start ---------- */
+async function start(){
+  el("startErr").innerHTML = "";
+  const sels = gatherSelections();
+  if(sels.length === 0){ el("startErr").innerHTML = `<div class="err">${esc(t("startNoSel"))}</div>`; return; }
+  const missing = sels.filter(s => !MAPPING[s.database]).map(s => s.database);
+  if(missing.length){ el("startErr").innerHTML = `<div class="err">${esc(t("unmappedStart", missing.join(", ")))}</div>`; return; }
+  const body = buildBaseBody(true);
+  body.tuning = readTuning();
+  // Copy the source's secondary indexes to the target (default on). _id is always
+  // built regardless — see server-side wiring. Off => only _id gets created.
+  body.syncSecondaryIndexes = el("syncSecIdx") ? el("syncSecIdx").checked : true;
+  const btn = el("startBtn"); btn.disabled = true; btn.textContent = t("startBtnBusy");
+  try {
+    const d = await postJSON("/api/start", body);
+    el("startHint").innerHTML = t("jobStarted", esc(d.jobID));
+    show("progressCard"); el("progressCard").scrollIntoView({behavior:"smooth"}); connect();
+  } catch(e){
+    el("startErr").innerHTML = `<div class="err">${esc(t("startFailed", e.message))}</div>`;
+  } finally { btn.disabled = false; btn.textContent = t("startBtn"); }
+}
+
+/* ---------- verify (post-migration) ---------- */
+async function runVerify(){
+  el("verifyResult").innerHTML = "";
+  const sels = gatherSelections();
+  if(sels.length === 0){ el("verifyResult").innerHTML = `<div class="err">${esc(t("verifyNoSel"))}</div>`; return; }
+  const missing = sels.filter(s => !MAPPING[s.database]).map(s => s.database);
+  if(missing.length){ el("verifyResult").innerHTML = `<div class="err">${esc(t("unmappedVerify", missing.join(", ")))}</div>`; return; }
+  const hash = el("verifyHash").checked;
+  const btn = el("verifyBtn"); btn.disabled = true; btn.textContent = hash?t("verifyBtnBusyHash"):t("verifyBtnBusy");
+  try {
+    const d = await postJSON("/api/verify" + (hash?"?hash=1":""), buildBaseBody(true));
+    renderVerify(d.report, d.ok);
+  } catch(e){
+    el("verifyResult").innerHTML = `<div class="err">${esc(t("verifyFailed", e.message))}</div>`;
+  } finally { btn.disabled = false; btn.textContent = t("verifyBtn"); }
+}
+
+function renderVerify(rep, ok){
+  rep = rep || {}; const cols = rep.collections || [];
+  let html = `<div style="margin-top:.5rem">` + (ok
+    ? `<span class="ok">${esc(t("verifyAllPass", cols.length))}</span>`
+    : `<span class="state-failed">${esc(t("verifySomeFail"))}</span>`) + `</div>`;
+  html += `<table style="margin-top:.5rem"><thead><tr><th>${esc(t("thCollection"))}</th><th>${esc(t("thSourceCount"))}</th><th>${esc(t("thTargetCount"))}</th><th>${esc(t("thCount"))}</th><th>${esc(t("thHash"))}</th><th>${esc(t("thNote"))}</th></tr></thead><tbody>`;
+  cols.forEach(c => {
+    const cok = (c.countMatch && (!c.hashChecked || c.hashMatch) && !c.err);
+    const cnt = c.countMatch ? `<span class="ok">${esc(t("match"))}</span>` : `<span class="state-failed">${esc(t("mismatch"))}</span>`;
+    const h = !c.hashChecked ? `<span class="muted">${esc(t("notChecked"))}</span>` : (c.hashMatch?`<span class="ok">${esc(t("match"))}</span>`:`<span class="state-failed">${esc(t("mismatch"))}</span>`);
+    let note = c.err ? esc(c.err) : "";
+    if(c.mismatches && c.mismatches.length){ note += (note?" · ":"") + esc(t("mismatchIds", c.mismatches.slice(0,5).join(", "))) + (c.mismatchMore?` …(+${c.mismatchMore})`:""); }
+    html += `<tr><td>${esc(c.database)}.${esc(c.source)}${cok?"":" ⚠"}</td>`
+      + `<td>${(c.sourceCount||0).toLocaleString()}</td><td>${(c.targetCount||0).toLocaleString()}</td>`
+      + `<td>${cnt}</td><td>${h}</td><td>${note||"-"}</td></tr>`;
+  });
+  html += `</tbody></table>`;
+  el("verifyResult").innerHTML = html;
+}
+
+/* ---------- live progress (SSE) ---------- */
+function fmtBytes(b){ if(b==null) return "-"; const u=["B","KB","MB","GB","TB","PB"]; let i=0; while(b>=1024 && i<u.length-1){b/=1024;i++;} return b.toFixed(i?1:0)+u[i]; }
+function fmtDur(s){ if(s==null||s<0) return t("unknown"); s=Math.round(s); const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60; return (h?h+"h":"")+(m?m+"m":"")+sec+"s"; }
+function control(job, action){ postJSON("/api/control", {job, action}).catch(e=>alert(t("controlFailed")+e.message)); }
+
+// RUNNING_JOB_ID is the id of the job the live-reconfig panel targets (set in render).
+let RUNNING_JOB_ID = null;
+// applyReconfig POSTs a live tuning change to the running job. perColl=true reads the
+// 针对某表 fields (a per-collection override); otherwise it changes the global knobs
+// + collection concurrency. Empty/zero inputs are omitted (leave unchanged).
+async function applyReconfig(perColl){
+  const msg = el("rcMsg");
+  if(!RUNNING_JOB_ID){ msg.textContent = t("noRunningJob"); return; }
+  const num = id => { const v = parseInt(el(id).value, 10); return (isFinite(v) && v > 0) ? v : 0; };
+  const body = { job: RUNNING_JOB_ID };
+  if(perColl){
+    const db = el("rcDb").value.trim(), coll = el("rcColl").value.trim();
+    if(!db || !coll){ msg.textContent = t("fillDbColl"); return; }
+    body.database = db; body.collection = coll;
+    const mp = num("rcCMaxParts"), w = num("rcCWorkers");
+    if(!mp && !w){ msg.textContent = t("fillOneCollNum"); return; }
+    if(mp) body.maxReadPartitions = mp;
+    if(w) body.workersPerPartition = w;
+  } else {
+    const c = num("rcConc"), mp = num("rcMaxParts"), w = num("rcWorkers");
+    if(!c && !mp && !w){ msg.textContent = t("fillOneNum"); return; }
+    if(c) body.concurrentCollections = c;
+    if(mp) body.maxReadPartitions = mp;
+    if(w) body.workersPerPartition = w;
+  }
+  try{
+    const d = await postJSON("/api/reconfig", body);
+    msg.textContent = "✅ " + (d.note || t("applied"));
+  }catch(e){ msg.textContent = "❌ " + e.message; }
+}
+// stopJob confirms first: 停止 ends the job for good, and the next 启动 wipes the
+// resume token + DLQ and re-migrates from scratch. If the operator only wants a
+// temporary halt they should use 暂停 (which this dialog points them to).
+function stopJob(job){
+  if(!confirm(t("stopConfirm"))) return;
+  control(job, "stop");
+}
+// Progress table paging/tab state. SSE pushes the full collection list every
+// tick; we bucket it into active vs done and page each bucket so a database with
+// hundreds/thousands of collections stays usable.
+const PROG_PAGE_SIZE = 50;
+let progTab = 'active';
+let progPage = { active: 0, done: 0 };
+let progCols = { active: [], done: [] };
+// Whether any job is actively streaming/loading right now. Drives whether live
+// rows keep their animated (indeterminate) bar or freeze — so pressing 停止
+// visibly stops the flashing. Recomputed each SSE tick in render().
+let JOB_RUNNING = false;
+
+// --- Cutover readiness + DLQ state (增量切换就绪 / 死信队列) ---
+// DLQ is a separate read-only endpoint (/api/dlq) polled on a timer; the SSE
+// status stream carries per-collection failed counts + lag. We combine them
+// here to compute the ready/amber/red signal the operator uses to decide when
+// it is safe to stop the source and cut over.
+let DLQ_BY_COLL = {};   // "db.coll" -> unresolved DLQ count
+let DLQ_TOTAL = 0;      // grand total unresolved
+let DLQ_REPORT = null;  // full /api/dlq report (for the detail panel)
+let DLQ_PANEL_OPEN = false;
+let STREAK = {};        // "db.coll" -> consecutive healthy SSE cycles
+let LAST_ST = null;     // last status snapshot (so the DLQ poll can re-render)
+let dlqPollTimer = null;
+
+// State→i18n key + which control is the "current" one to highlight.
+const STATE_LABEL = {
+  "created":"state_created", "assessing":"state_assessing", "initial-load":"state_initialLoad",
+  "live":"state_live", "verifying":"state_verifying", "done":"state_done",
+  "failed":"state_failed", "paused":"state_paused",
+};
+function stateIsRunning(s){ return s==="initial-load" || s==="live" || s==="assessing" || s==="verifying"; }
+
+function render(st){
+  LAST_ST = st;
+  el("status").textContent = (st.ready?"✅ ready":"⏳ not ready") + " · " + new Date(st.timestamp).toLocaleTimeString();
+  const jobs = st.jobs || [];
+  JOB_RUNNING = jobs.some(j => stateIsRunning(j.state));
+  // Capture the running job id for the live-reconfig panel and show/hide it. The
+  // panel is static markup (not rebuilt each tick) so typed values survive ticks.
+  const runningJob = jobs.find(j => stateIsRunning(j.state));
+  RUNNING_JOB_ID = runningJob ? runningJob.id : null;
+  const sp = el("speedPanel"); if(sp) sp.classList.toggle("hidden", !RUNNING_JOB_ID);
+  // Reset is destructive to session state; only allow it when nothing is running.
+  const rb = el("resetBtn"); if(rb) rb.disabled = JOB_RUNNING;
+  // Advance per-collection health streaks on this SSE tick (before rendering the
+  // rows / cutover card that read them).
+  updateStreaks(st);
+  const jobsEl = el("jobs"); jobsEl.innerHTML = "";
+  // Deferred index-build progress ("创建索引 M/N"), keyed by job id. Only shown
+  // once a build has launched (total > 0); on Firestore indexes are built after
+  // the data load (full-only) or once live lag settles.
+  const idxByJob = {}; (st.indexProgress||[]).forEach(p => { if(p && p.total>0) idxByJob[p.job] = p; });
+  jobs.forEach((j, jIdx) => {
+    const d = document.createElement("div"); d.className = "job";
+    const running = stateIsRunning(j.state);
+    const paused = j.state === "paused";
+    const finished = j.state === "done" || j.state === "failed";
+    // Button colours reflect state: highlight the action that reflects "now",
+    // and disable actions that can't apply so the user reads the state at a glance.
+    // running  → 暂停/停止 available, 停止 tinted red; 继续 disabled.
+    // paused   → 继续 highlighted green, 停止 available; 暂停 disabled.
+    // finished → all disabled (nothing to control).
+    // Titles spell out the pause-vs-stop difference: 暂停 keeps the job + resume
+    // token (原地恢复), 停止 ends it — and a fresh 启动 wipes state (从头重迁).
+    const pauseBtn  = `<button class="secondary${paused?" on-pause":""}" ${(!running)?"disabled":""} title="${esc(t("pauseTitle"))}" onclick="control('${jsstr(j.id)}','pause')">${esc(paused?t("paused"):t("pause"))}</button>`;
+    const resumeBtn = `<button class="secondary${paused?" on-resume":""}" ${(!paused)?"disabled":""} title="${esc(t("resumeTitle"))}" onclick="control('${jsstr(j.id)}','resume')">${esc(t("resume"))}</button>`;
+    const stopBtn   = `<button class="secondary${finished?"":" on-stop"}" ${finished?"disabled":""} title="${esc(t("stopTitle"))}" onclick="stopJob('${jsstr(j.id)}')">${esc(finished?t("stopped"):t("stop"))}</button>`;
+    const ip = idxByJob[j.id];
+    let idxLine = "";
+    if(ip){
+      const done = ip.done||0, tot = ip.total||0, pct = tot>0 ? Math.min(100, done/tot*100) : 0;
+      const buildingTxt = (done<tot && ip.building) ? t("buildingIdx", esc(ip.building)) : (done>=tot ? t("idxDone") : "");
+      idxLine = `<div class="muted" style="margin-top:.3rem">${esc(t("creatingIdx", done.toLocaleString(), tot.toLocaleString()))}`
+        + `<div class="bar" style="max-width:220px;display:inline-block;vertical-align:middle;margin:0 .4rem"><span style="width:${pct.toFixed(1)}%"></span></div>`
+        + `${buildingTxt}</div>`;
+    }
+    d.innerHTML = `<span class="state state-${j.state}">${j.state}</span> <code>${esc(j.id)}</code> <span class="muted">${esc(j.mode||"")}</span>`
+      + `<span class="jobstate state-${j.state}">${esc(STATE_LABEL[j.state] ? t(STATE_LABEL[j.state]) : j.state)}</span>`
+      + (j.error ? ` <span class="state-failed">${esc(j.error)}</span>` : "")
+      + idxLine
+      + `<div class="controls" style="margin-top:.3rem">` + pauseBtn + resumeBtn + stopBtn + `</div>`
+      + `<div class="muted" style="margin-top:.25rem;font-size:.78rem">${esc(t("pauseStopHint"))}</div>`;
+    jobsEl.appendChild(d);
+  });
+  // Bucket into active (running/pending) vs done, 全量 before 增量 then by name.
+  const cols = (st.collections||[]).slice().sort((a,b)=>{
+    if(a.phase!==b.phase) return a.phase==="initial"?-1:1;
+    return (a.database+a.collection).localeCompare(b.database+b.collection);
+  });
+  progCols.active = cols.filter(c => !isCollDone(c));
+  progCols.done   = cols.filter(isCollDone);
+  el("cntActive").textContent = progCols.active.length;
+  el("cntDone").textContent   = progCols.done.length;
+  renderProgRows();
+  renderCutover(st);
+}
+
+// --- Cutover readiness (增量切换就绪判定) ---
+// Thresholds come from the engine's config, echoed in the status payload, so the
+// UI judges "caught up" with the same numbers the migrator uses (fallback 5s/3).
+function cutoverThresholds(st){
+  const lag    = (st && st.cutoverLagThreshold>0) ? st.cutoverLagThreshold : 5;
+  const stable = (st && st.cutoverStableChecks>0) ? st.cutoverStableChecks : 3;
+  return {lag, stable};
+}
+
+// updateStreaks advances (or resets) each live collection's consecutive-healthy
+// counter once per SSE tick. Healthy = no failed writes, no DLQ entries, and lag
+// within threshold (or idle). Frozen (job stopped) → streak is left untouched so
+// a stopped-but-clean run keeps its green. Called once per render().
+function updateStreaks(st){
+  const {lag} = cutoverThresholds(st);
+  const liveKeys = new Set();
+  (st.collections||[]).filter(c=>c.phase==="live").forEach(c=>{
+    const key = c.database + "." + c.collection; liveKeys.add(key);
+    if(!JOB_RUNNING) return; // frozen: don't advance while nothing streams
+    const failed = c.failed || 0;
+    const dlq = DLQ_BY_COLL[key] || 0;
+    const lagOK = (c.lagSeconds==null) || c.lagSeconds < 0 || c.lagSeconds <= lag;
+    STREAK[key] = (failed===0 && dlq===0 && lagOK) ? (STREAK[key]||0)+1 : 0;
+  });
+  Object.keys(STREAK).forEach(k=>{ if(!liveKeys.has(k)) delete STREAK[k]; });
+}
+
+// collReadiness classifies one live collection. Red (DLQ/failed) overrides
+// everything; green requires caught-up lag AND N consecutive healthy cycles;
+// otherwise amber (still catching up / stabilizing).
+function collReadiness(c, st){
+  const key = c.database + "." + c.collection;
+  const {lag, stable} = cutoverThresholds(st);
+  const failed = c.failed || 0;
+  const dlq = DLQ_BY_COLL[key] || 0;
+  const lagOK = (c.lagSeconds==null) || c.lagSeconds < 0 || c.lagSeconds <= lag;
+  const streak = STREAK[key] || 0;
+  let level;
+  if(dlq>0 || failed>0)          level = "red";
+  else if(!lagOK || streak<stable) level = "amber";
+  else                            level = "green";
+  return {level, streak, need: stable, dlq, failed, lagOK, lagThr: lag};
+}
+
+// renderCutover paints the global R/Y/G card by aggregating every live
+// collection (worst wins). Neutral when no incremental data yet.
+function renderCutover(st){
+  const card = el("cutoverCard");
+  const live = (st.collections||[]).filter(c=>c.phase==="live");
+  const {lag, stable} = cutoverThresholds(st);
+  if(live.length===0){
+    card.className = "cutover-card neutral";
+    card.innerHTML = `<div class="cut-light">⚪</div><div class="cut-body"><b>${esc(t("cutoverInitial"))}</b>`
+      + `<div class="muted">${esc(t("cutoverInitialDesc"))}</div></div>`;
+    return;
+  }
+  let worst="green", totFailed=0, totDlq=0, totEvents=0, maxLag=-1, minStreak=Infinity;
+  live.forEach(c=>{
+    const r = collReadiness(c, st);
+    totFailed += r.failed; totDlq += r.dlq;
+    totEvents += (c.snapshot && c.snapshot.doneDocs) || 0;
+    if(c.lagSeconds!=null && c.lagSeconds > maxLag) maxLag = c.lagSeconds;
+    minStreak = Math.min(minStreak, r.streak);
+    if(r.level==="red") worst="red";
+    else if(r.level==="amber" && worst!=="red") worst="amber";
+  });
+  if(minStreak===Infinity) minStreak = 0;
+
+  const V = {
+    red:   ["🔴", t("cutoverRedTitle"), t("cutoverRedStep")],
+    amber: ["🟡", t("cutoverAmberTitle"), t("cutoverAmberStep", lag, stable, minStreak)],
+    green: ["🟢", t("cutoverGreenTitle"), t("cutoverGreenStep")],
+  };
+  const v = V[worst];
+  card.className = "cutover-card " + worst;
+  const lagTxt = maxLag < 0 ? t("idle") : fmtDur(maxLag);
+  card.innerHTML = `<div class="cut-light">${v[0]}</div><div class="cut-body">`
+    + `<b>${esc(t("cutoverReadyPrefix") + v[1])}</b>`
+    + `<div class="muted" style="margin-top:.2rem">${esc(t("liveColls", live.length))} · ${esc(t("cumEvents", totEvents.toLocaleString()))} · `
+    + `${esc(t("failedLabel"))} <span class="${totFailed?'bad':''}">${totFailed.toLocaleString()}</span> · `
+    + `DLQ <span class="${totDlq?'bad':''}">${totDlq.toLocaleString()}</span> · `
+    + `${esc(t("maxLag", lagTxt))} · ${esc(t("minStable", minStreak, stable))}</div>`
+    + `<div class="cut-steps">${esc(v[2])}</div></div>`;
+}
+
+// --- DLQ panel + banner (死信队列) ---
+async function pollDlq(){
+  try{
+    const res = await fetch("/api/dlq");
+    if(!res.ok) return;
+    const rep = await res.json();
+    DLQ_REPORT = rep;
+    DLQ_TOTAL = rep.total || 0;
+    DLQ_BY_COLL = {};
+    (rep.collections||[]).forEach(g=>{ DLQ_BY_COLL[g.sourceDB + "." + g.sourceCollection] = g.count; });
+    renderDlqBanner();
+    renderDlqPanel();
+    // Refresh rows + cutover with the new DLQ numbers (SSE may not tick meanwhile).
+    if(LAST_ST){ renderProgRows(); renderCutover(LAST_ST); }
+  }catch(e){ /* transient; next poll retries */ }
+}
+
+function renderDlqBanner(){
+  const b = el("dlqBanner");
+  if(DLQ_TOTAL > 0){
+    b.className = "dlq-banner";
+    b.innerHTML = t("dlqBanner", DLQ_TOTAL.toLocaleString())
+      + `<button class="secondary" onclick="toggleDlqPanel()">${esc(DLQ_PANEL_OPEN?t("collapseDetails"):t("viewDetails"))}</button>`;
+  } else {
+    b.className = "dlq-banner hidden";
+    b.innerHTML = "";
+  }
+}
+
+function toggleDlqPanel(){ DLQ_PANEL_OPEN = !DLQ_PANEL_OPEN; renderDlqBanner(); renderDlqPanel(); }
+
+function renderDlqPanel(){
+  const p = el("dlqPanel");
+  if(!DLQ_PANEL_OPEN || !DLQ_REPORT || (DLQ_REPORT.total||0)===0){
+    p.className = "dlq-panel hidden"; p.innerHTML = ""; return;
+  }
+  p.className = "dlq-panel";
+  let h = `<h3>${esc(t("dlqPanelTitle", DLQ_REPORT.total.toLocaleString()))}</h3>`;
+  // No retry button: while live replication is running you simply fix the offending
+  // document in the SOURCE (keeping its _id), and the change stream re-applies it as
+  // an update — the DLQ entry auto-resolves. This note tells the operator that.
+  h += `<div class="dlq-retry">` + t("dlqRetryNote") + `</div>`;
+  (DLQ_REPORT.collections||[]).forEach((g, gi)=>{
+    h += `<details class="dlq-grp"><summary><b>${esc(g.sourceDB)}.${esc(g.sourceCollection)}</b> ${esc(t("entriesCount", g.count.toLocaleString()))}`
+      + (g.truncated ? t("showingFirst", g.returned) : "") + `</summary>`;
+    h += `<table class="dlqtbl"><thead><tr><th>${esc(t("thDocId"))}</th><th>${esc(t("thOp"))}</th><th>${esc(t("thPhase"))}</th><th>${esc(t("thError"))}</th><th>${esc(t("thTime"))}</th></tr></thead><tbody>`;
+    (g.entries||[]).forEach((e, ei)=>{
+      const id = gi + "_" + ei;
+      h += `<tr class="dlq-row" onclick="toggleDlqDoc('${id}')">`
+        + `<td><code>${esc(e.documentID||"")}</code></td><td>${esc(e.opType||"-")}</td>`
+        + `<td>${esc(e.phase||"-")}</td><td class="dlq-err" title="${esc(e.error||"")}">${esc(e.error||"")}</td>`
+        + `<td class="muted">${esc(e.timestamp||"")}</td></tr>`;
+      const doc = e.document!=null ? JSON.stringify(e.document, null, 2) : t("noDocSnapshot");
+      h += `<tr id="dlqdoc_${id}" class="hidden dlq-doc"><td colspan="5"><pre>${esc(doc)}</pre></td></tr>`;
+    });
+    h += `</tbody></table></details>`;
+  });
+  p.innerHTML = h;
+}
+
+function toggleDlqDoc(id){ const r = el("dlqdoc_" + id); if(r) r.classList.toggle("hidden"); }
+
+// --- Session reset (重置会话) ---
+async function resetSession(){
+  if(JOB_RUNNING){ alert(t("resetJobRunning")); return; }
+  const ok = confirm(t("resetConfirm"));
+  if(!ok) return;
+  try{
+    const res = await fetch("/api/reset", {method:"POST"});
+    const j = await res.json();
+    if(!res.ok){ alert(t("resetFailed") + (j.error || res.status)); return; }
+    // Clear local UI state so stale rows/badges don't linger until the next tick.
+    STREAK = {}; DLQ_BY_COLL = {}; DLQ_TOTAL = 0; DLQ_REPORT = null; DLQ_PANEL_OPEN = false;
+    if(typeof PENDING !== "undefined" && PENDING && PENDING.clear) PENDING.clear();
+    renderDlqBanner(); renderDlqPanel();
+    if(LAST_ST){ renderProgRows(); renderCutover(LAST_ST); }
+    let msg = t("resetDone");
+    msg += t("resetPlanCleared") + (j.backup ? t("backedUpTo", j.backup) : "") + "\n";
+    msg += t("resetJobsPurged", j.jobsPurged);
+    const files = j.filesRemoved || [];
+    msg += t("resetFilesRemoved", files.length) + (files.length ? ":\n  " + files.join("\n  ") : "");
+    alert(msg);
+  }catch(e){ alert(t("resetFailed") + e); }
+}
+
+// isCollDone: a 全量 collection is done once every document is written. 增量
+// (live) streams tail forever, so they always count as active.
+function isCollDone(c){
+  if(c.phase === "live") return false;
+  const s = c.snapshot || {};
+  return (s.totalDocs||0) > 0 && (s.doneDocs||0) >= (s.totalDocs||0);
+}
+
+// collRowHTML renders one collection's <tr>; shared by both tabs.
+function collRowHTML(c){
+  const s = c.snapshot || {};
+
+  // Error rows: a whole database pair that couldn't (re)start replication. Render
+  // distinctly with the reason inline instead of a progress bar, so a blocked db
+  // is visible in the console rather than silently vanishing.
+  if(c.phase === "error"){
+    return `<tr><td>${esc(c.database)}.${esc(c.collection)}</td>`
+      + `<td><span class="ph ph-error">${esc(t("phError"))}</span></td>`
+      + `<td colspan="8" class="errcell">${esc(c.error||t("cannotStartRepl"))}</td></tr>`;
+  }
+
+  const isLive = c.phase === "live";
+  // A live row keeps its animated shuttle only while the job is actively
+  // running. Once stopped/paused/finished, freeze the bar so it stops flashing
+  // and the user can trust that nothing is still moving.
+  const liveFrozen = isLive && !JOB_RUNNING;
+  const phaseLabel = liveFrozen
+    ? `<span class="ph ph-stopped">${esc(t("phLiveStopped"))}</span>`
+    : (isLive
+        ? `<span class="ph ph-live">${esc(t("phLive"))}</span>`
+        : `<span class="ph ph-init">${esc(t("phInitial"))}</span>`);
+
+  // Throughput: docs/s for both phases (legacy path reports docsPerSec, not bytes).
+  const rate = liveFrozen ? 0 : (s.docsPerSec || 0);
+  const rateCell = `${rate>=1?Math.round(rate):rate.toFixed(2)} ${esc(isLive?t("events"):t("docs"))}/s`;
+
+  let barCell, pctCell;
+  if(isLive){
+    // Live/incremental streams have no meaningful "% complete" — the tail runs
+    // forever — so we do NOT draw a progress bar that would imply an end. Instead
+    // show a pulsing "streaming" indicator + the running event count. Readiness
+    // for cutover is judged by the 失败/DLQ/就绪 columns and the card above.
+    barCell = liveFrozen
+      ? `<span class="muted">${esc(t("eventsStopped", (s.doneDocs||0).toLocaleString()))}</span>`
+      : `<span class="stream-dot"></span><span class="muted">${esc(t("eventsTailing", (s.doneDocs||0).toLocaleString()))}</span>`;
+    pctCell = `<span class="muted">—</span>`;
+  } else {
+    const known = (s.totalDocs||0) > 0;
+    const pct = known ? (s.percentDocs||0) : 0;
+    barCell = known
+      ? `<div class="bar"><span style="width:${pct.toFixed(1)}%"></span></div><span class="muted">${(s.doneDocs||0).toLocaleString()}/${(s.totalDocs||0).toLocaleString()}</span>`
+      : `<div class="bar indet"><span></span></div><span class="muted">${esc(t("writtenCounting", (s.doneDocs||0).toLocaleString()))}</span>`;
+    pctCell = known ? `${pct.toFixed(1)}%` : `<span class="muted">…</span>`;
+  }
+
+  const etaCell = isLive
+    ? "-"
+    : (s.eta!=null && s.eta>=0 ? fmtDur(s.eta/1e9)+(s.etaReliable?"":" ⏳") : t("unknown"));
+  const lagCell = (isLive && c.lagSeconds!=null && c.lagSeconds>=0) ? fmtDur(c.lagSeconds)
+    : (isLive ? `<span class="muted">${esc(t("idle"))}</span>` : "-");
+
+  // Cutover columns: only meaningful for live (增量) rows. Initial rows show "-".
+  let failedCell = "-", dlqCell = "-", readyCell = "-";
+  if(isLive){
+    const key = c.database + "." + c.collection;
+    const failed = c.failed || 0;
+    const dlq = DLQ_BY_COLL[key] || 0;
+    failedCell = failed>0 ? `<span class="bad">${failed.toLocaleString()}</span>` : "0";
+    dlqCell    = dlq>0    ? `<span class="bad">${dlq.toLocaleString()}</span>`    : "0";
+    const r = collReadiness(c, LAST_ST || {});
+    const M = {green:["🟢",t("rdyGreen")], amber:["🟡",t("rdyAmber")], red:["🔴",t("rdyRed")]};
+    const m = M[r.level];
+    let tip;
+    if(r.level==="red")        tip = t("tipRed", r.failed, r.dlq);
+    else if(r.level==="green") tip = t("tipGreen", r.streak, r.need);
+    else                       tip = !r.lagOK ? t("tipLagHigh", r.lagThr) : t("tipStabilizing", r.streak, r.need);
+    readyCell = `<span class="rdy" title="${esc(tip)}">${m[0]} ${m[1]}</span>`;
+  }
+
+  return `<tr><td>${esc(c.database)}.${esc(c.collection)}</td><td>${phaseLabel}</td>`
+    + `<td>${barCell}</td><td>${pctCell}</td><td>${rateCell}</td><td>${etaCell}</td><td>${lagCell}</td>`
+    + `<td>${failedCell}</td><td>${dlqCell}</td><td>${readyCell}</td></tr>`;
+}
+
+// renderProgRows paints the current tab's page and the pager.
+function renderProgRows(){
+  const list = progCols[progTab] || [];
+  const pages = Math.max(1, Math.ceil(list.length / PROG_PAGE_SIZE));
+  if(progPage[progTab] >= pages) progPage[progTab] = pages - 1;
+  if(progPage[progTab] < 0) progPage[progTab] = 0;
+  const start = progPage[progTab] * PROG_PAGE_SIZE;
+  const slice = list.slice(start, start + PROG_PAGE_SIZE);
+  el("rows").innerHTML = slice.length
+    ? slice.map(collRowHTML).join("")
+    : `<tr><td colspan="10" class="muted">${esc(t("noCollsInTab"))}</td></tr>`;
+  el("pager").innerHTML = pages > 1
+    ? `<button class="secondary" ${progPage[progTab]<=0?"disabled":""} onclick="progGo(-1)">${esc(t("prevPage"))}</button>`
+      + `<span class="muted">${esc(t("pagerInfo", progPage[progTab]+1, pages, list.length, PROG_PAGE_SIZE))}</span>`
+      + `<button class="secondary" ${progPage[progTab]>=pages-1?"disabled":""} onclick="progGo(1)">${esc(t("nextPage"))}</button>`
+    : `<span class="muted">${esc(t("totalColls", list.length))}</span>`;
+}
+
+function setProgTab(t){
+  progTab = t;
+  el("tabActive").classList.toggle("active", t === 'active');
+  el("tabDone").classList.toggle("active", t === 'done');
+  renderProgRows();
+}
+function progGo(delta){ progPage[progTab] += delta; renderProgRows(); }
+let es = null;
+function connect(){
+  if(es) return;
+  es = new EventSource("/api/stream");
+  es.onmessage = ev => { try { render(JSON.parse(ev.data)); } catch(e){} };
+  es.onerror = () => { el("status").textContent = t("connLost"); };
+  // DLQ is read from a separate endpoint on its own cadence.
+  if(!dlqPollTimer){ pollDlq(); dlqPollTimer = setInterval(pollDlq, 3000); }
+}
+
+// Remember the last-used source connection string across page loads. The
+// hardcoded value= on #source is only a first-run fallback; once the operator
+// switches sources, that choice must STICK on refresh — same "don't cling to the
+// old source" contract the remediation-plan fingerprint enforces server-side.
+// This script tag sits at the end of <body>, so the DOM is already parsed.
+(function initSourceMemory(){
+  try {
+    const inp = el("source");
+    if(!inp) return;
+    const saved = localStorage.getItem("srcConn");
+    if(saved) inp.value = saved;
+    inp.addEventListener("input", () => { try { localStorage.setItem("srcConn", inp.value); } catch(e){} });
+  } catch(e){}
+})();
+
+// Apply the chosen language to the static markup + toggle on first paint. The
+// script is at the end of <body>, so the DOM is already parsed here.
+(function initLang(){
+  document.querySelectorAll('#langToggle button').forEach(b => b.classList.toggle('active', b.dataset.lang === LANG));
+  applyI18n();
+})();
+</script>
+</body>
+</html>

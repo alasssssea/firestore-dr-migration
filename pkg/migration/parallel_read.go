@@ -1,0 +1,967 @@
+package migration
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"sort"
+	"strconv"
+	"time"
+
+	"firestore-dr-migration/pkg/logger"
+	"firestore-dr-migration/pkg/partition"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+// CollectionPartitioner handles partitioning a collection for parallel reads
+type CollectionPartitioner struct {
+	sourceCollection    *mongo.Collection
+	log                 *logger.Logger
+	maxPartitions       int
+	minDocsPerPartition int
+	sampleSize          int
+	idTypeForPartition  string
+}
+
+// NewCollectionPartitioner creates a new collection partitioner
+func NewCollectionPartitioner(sourceCollection *mongo.Collection,
+	log *logger.Logger, maxPartitions, minDocsPerPartition, sampleSize int, idTypeForPartition string) *CollectionPartitioner {
+	return &CollectionPartitioner{
+		sourceCollection:    sourceCollection,
+		log:                 log,
+		maxPartitions:       maxPartitions,
+		minDocsPerPartition: minDocsPerPartition,
+		sampleSize:          sampleSize,
+		idTypeForPartition:  idTypeForPartition,
+	}
+}
+
+// CalculatePartitionCount calculates the optimal partition count based on
+// document count, min docs per partition, and max partitions. It delegates to
+// partition.Count, the single source of truth shared with the assessment
+// recommender so the advised MaxReadPartitions matches what the engine creates.
+func CalculatePartitionCount(totalCount int64, minDocsPerPartition, maxPartitions int) int {
+	return partition.Count(totalCount, minDocsPerPartition, maxPartitions)
+}
+
+// CalculatePartitionCount calculates the optimal partition count for the partitioner's configured settings.
+func (p *CollectionPartitioner) CalculatePartitionCount(count int64) int {
+	return CalculatePartitionCount(count, p.minDocsPerPartition, p.maxPartitions)
+}
+
+// Partition creates partitions for a collection
+func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error) {
+	// Count documents to determine if partitioning is needed
+	// Use a longer timeout for the count operation
+	countCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	count, err := p.sourceCollection.EstimatedDocumentCount(countCtx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count documents: %w", err)
+	}
+
+	// Calculate optimal partition count
+	partitionCount := p.CalculatePartitionCount(count)
+	p.log.Infof("Partitioning collection with %d documents into %d partitions", count, partitionCount)
+
+	// If only one partition, return a single empty filter
+	if partitionCount == 1 {
+		return []bson.D{{}}, nil
+	}
+
+	strategy := p.idTypeForPartition
+	if strategy == "auto" || strategy == "" {
+		detected, err := p.RecommendIDPartitioning(ctx)
+		if err != nil {
+			p.log.Warnf("Failed to auto-detect partitioning ID type: %v. Falling back to 'mixed'", err)
+			strategy = "mixed"
+		} else {
+			p.log.Infof("Auto-detected partition ID strategy type: %s", detected)
+			strategy = detected
+		}
+	}
+
+	// Determine partition strategy based on strategy
+	switch strategy {
+	case "objectid":
+		return p.createObjectIDPartitionsWithSampling(ctx, partitionCount)
+	case "numeric":
+		return p.createNumericPartitionsWithSampling(ctx, partitionCount)
+	case "mixed", "auto", "":
+		return p.createPartitionsGroupedByType(ctx, partitionCount)
+	default:
+		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to grouped-by-type mixed mode partitioning", strategy)
+		return p.createPartitionsGroupedByType(ctx, partitionCount)
+	}
+}
+
+// createObjectIDPartitionsWithSampling creates partitions based on ObjectID sampling
+func (p *CollectionPartitioner) createObjectIDPartitionsWithSampling(ctx context.Context, partitionCount int) ([]bson.D, error) {
+	// Adjust sample size based on collection size, but ensure it's large enough
+	sampleSize := p.sampleSize
+	if sampleSize < partitionCount*10 {
+		sampleSize = partitionCount * 10 // Ensure at least 10 samples per partition
+	}
+
+	p.log.Infof("Sampling %d documents to create %d partitions", sampleSize, partitionCount)
+
+	// Sample documents to understand the _id distribution
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sample documents: %w", err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	// Collect all sampled _ids
+	var sampledIDs []primitive.ObjectID
+	for cursor.Next(sampleCtx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
+		}
+
+		if id, ok := doc["_id"].(primitive.ObjectID); ok {
+			sampledIDs = append(sampledIDs, id)
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error during sampling: %w", err)
+	}
+
+	// Deduplicate sampled IDs
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if id != uniqueIDs[len(uniqueIDs)-1] {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
+	}
+
+	// If not enough samples, fall back to min/max approach
+	if len(sampledIDs) < partitionCount+1 {
+		p.log.Warnf("Not enough samples (%d) for %d partitions, falling back to min/max approach",
+			len(sampledIDs), partitionCount)
+		return p.createObjectIDPartitionsWithMinMax(ctx)
+	}
+
+	// Use sampled IDs to create partitions
+	partitions := make([]bson.D, 0, partitionCount)
+
+	// Calculate step size to evenly distribute partitions
+	step := len(sampledIDs) / (partitionCount + 1)
+
+	// Create partition filters
+	for i := 0; i < partitionCount; i++ {
+		startIdx := (i + 1) * step // Skip the first step to avoid edge cases
+		endIdx := (i + 2) * step
+
+		if endIdx >= len(sampledIDs) {
+			endIdx = len(sampledIDs) - 1
+		}
+
+		startID := sampledIDs[startIdx]
+		endID := sampledIDs[endIdx]
+
+		if i == 0 {
+			// First partition includes everything up to the first boundary
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: endID}}}})
+		} else if i == partitionCount-1 {
+			// Last partition includes everything from the last boundary
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
+		} else {
+			// Middle partitions
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$gte", Value: startID},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		}
+	}
+
+	return partitions, nil
+}
+
+// createObjectIDPartitionsWithMinMax creates partitions based on min/max ObjectIDs
+func (p *CollectionPartitioner) createObjectIDPartitionsWithMinMax(ctx context.Context) ([]bson.D, error) {
+	// Find min and max ObjectIDs
+	var minDoc, maxDoc bson.M
+
+	err := p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}})).Decode(&minDoc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find min _id: %w", err)
+	}
+
+	err = p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}})).Decode(&maxDoc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find max _id: %w", err)
+	}
+
+	minID, _ := minDoc["_id"].(primitive.ObjectID)
+	maxID, _ := maxDoc["_id"].(primitive.ObjectID)
+
+	// For ObjectIDs, we can use timestamp-based partitioning
+	minTime := minID.Timestamp()
+	maxTime := maxID.Timestamp()
+	timeRange := maxTime.Sub(minTime)
+
+	// Calculate optimal partition count based on time range
+	partitionCount := p.maxPartitions
+	partitionDuration := timeRange / time.Duration(partitionCount)
+
+	// Create partitions
+	partitions := make([]bson.D, 0, partitionCount)
+
+	for i := 0; i < partitionCount; i++ {
+		startTime := minTime.Add(partitionDuration * time.Duration(i))
+		startID := primitive.NewObjectIDFromTimestamp(startTime)
+
+		var endTime time.Time
+		if i == partitionCount-1 {
+			// Last partition includes the max ID
+			endTime = maxTime.Add(time.Second) // Add a second to ensure inclusion
+		} else {
+			endTime = minTime.Add(partitionDuration * time.Duration(i+1))
+		}
+		endID := primitive.NewObjectIDFromTimestamp(endTime)
+
+		if i == 0 {
+			// First partition
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: endID}}}})
+		} else if i == partitionCount-1 {
+			// Last partition
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
+		} else {
+			// Middle partitions
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$gte", Value: startID},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		}
+	}
+
+	return partitions, nil
+}
+
+// createNumericPartitionsWithSampling creates partitions based on numeric _id sampling
+func (p *CollectionPartitioner) createNumericPartitionsWithSampling(ctx context.Context, partitionCount int) ([]bson.D, error) {
+	// Adjust sample size based on collection size, but ensure it's large enough
+	sampleSize := p.sampleSize
+	if sampleSize < partitionCount*10 {
+		sampleSize = partitionCount * 10 // Ensure at least 10 samples per partition
+	}
+
+	p.log.Infof("Sampling %d documents to create %d partitions", sampleSize, partitionCount)
+
+	// Sample documents to understand the _id distribution
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sample documents: %w", err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	// Collect all sampled _ids as float64 for consistent handling
+	var sampledIDs []float64
+	for cursor.Next(sampleCtx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
+		}
+
+		// Convert various numeric types to float64
+		var numericID float64
+		switch id := doc["_id"].(type) {
+		case int:
+			numericID = float64(id)
+		case int32:
+			numericID = float64(id)
+		case int64:
+			numericID = float64(id)
+		case float64:
+			numericID = id
+		default:
+			continue // Skip non-numeric IDs
+		}
+
+		sampledIDs = append(sampledIDs, numericID)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error during sampling: %w", err)
+	}
+
+	// Deduplicate sampled IDs
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if id != uniqueIDs[len(uniqueIDs)-1] {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
+	}
+
+	// If not enough samples, fall back to min/max approach
+	if len(sampledIDs) < partitionCount+1 {
+		p.log.Warnf("Not enough samples (%d) for %d partitions, falling back to min/max approach",
+			len(sampledIDs), partitionCount)
+		return p.createNumericPartitionsWithMinMax(ctx)
+	}
+
+	// Use sampled IDs to create partitions
+	partitions := make([]bson.D, 0, partitionCount)
+
+	// Calculate step size to evenly distribute partitions
+	step := len(sampledIDs) / (partitionCount + 1)
+
+	// Create partition filters
+	for i := 0; i < partitionCount; i++ {
+		startIdx := (i + 1) * step // Skip the first step to avoid edge cases
+		endIdx := (i + 2) * step
+
+		if endIdx >= len(sampledIDs) {
+			endIdx = len(sampledIDs) - 1
+		}
+
+		startID := sampledIDs[startIdx]
+		endID := sampledIDs[endIdx]
+
+		if i == 0 {
+			// First partition includes everything up to the first boundary
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: endID}}}})
+		} else if i == partitionCount-1 {
+			// Last partition includes everything from the last boundary
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
+		} else {
+			// Middle partitions
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$gte", Value: startID},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		}
+	}
+
+	return partitions, nil
+}
+
+// createNumericPartitionsWithMinMax creates partitions based on min/max numeric IDs
+func (p *CollectionPartitioner) createNumericPartitionsWithMinMax(ctx context.Context) ([]bson.D, error) {
+	// Find min and max numeric IDs
+	var minDoc, maxDoc bson.M
+
+	err := p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}})).Decode(&minDoc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find min _id: %w", err)
+	}
+
+	err = p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}})).Decode(&maxDoc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find max _id: %w", err)
+	}
+
+	// Convert to float64 for consistent handling
+	var minID, maxID float64
+
+	switch id := minDoc["_id"].(type) {
+	case int:
+		minID = float64(id)
+	case int32:
+		minID = float64(id)
+	case int64:
+		minID = float64(id)
+	case float64:
+		minID = id
+	}
+
+	switch id := maxDoc["_id"].(type) {
+	case int:
+		maxID = float64(id)
+	case int32:
+		maxID = float64(id)
+	case int64:
+		maxID = float64(id)
+	case float64:
+		maxID = id
+	}
+
+	// Calculate range for each partition
+	partitionCount := p.maxPartitions
+	idRange := maxID - minID
+	partitionSize := idRange / float64(partitionCount)
+
+	// Create partitions
+	partitions := make([]bson.D, 0, partitionCount)
+
+	for i := 0; i < partitionCount; i++ {
+		startID := minID + (partitionSize * float64(i))
+
+		var endID float64
+		if i == partitionCount-1 {
+			// Last partition includes the max ID
+			endID = maxID + 1 // Add 1 to ensure inclusion
+		} else {
+			endID = minID + (partitionSize * float64(i+1))
+		}
+
+		if i == 0 {
+			// First partition
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: endID}}}})
+		} else if i == partitionCount-1 {
+			// Last partition
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
+		} else {
+			// Middle partitions
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$gte", Value: startID},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		}
+	}
+
+	return partitions, nil
+}
+
+// Helper function to interpolate between two hex strings
+func interpolateHex(minHex, maxHex string, ratio float64) string {
+	if len(minHex) != len(maxHex) {
+		return minHex // Fallback
+	}
+
+	result := make([]byte, len(minHex))
+
+	for i := 0; i < len(minHex); i++ {
+		minVal, _ := strconv.ParseInt(string(minHex[i]), 16, 8)
+		maxVal, _ := strconv.ParseInt(string(maxHex[i]), 16, 8)
+
+		interpolated := minVal + int64(ratio*float64(maxVal-minVal))
+		if interpolated > 15 {
+			interpolated = 15
+		}
+
+		result[i] = "0123456789abcdef"[interpolated]
+	}
+
+	return string(result)
+}
+
+// createPartitionsWithSampling creates partitions using sampling for any sortable _id type
+func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context, partitionCount int) ([]bson.D, error) {
+	sampleSize := max(p.sampleSize, partitionCount*10)
+	p.log.Infof("Sampling %d documents to create %d partitions", sampleSize, partitionCount)
+
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sample documents: %w", err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	type idDoc struct {
+		ID interface{} `bson:"_id"`
+	}
+
+	var sampledIDs []interface{}
+	for cursor.Next(sampleCtx) {
+		var doc idDoc
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
+		}
+		if doc.ID != nil {
+			sampledIDs = append(sampledIDs, doc.ID)
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error during sampling: %w", err)
+	}
+
+	// Deduplicate sampled IDs using reflect.DeepEqual (supports slice/document IDs)
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if !reflect.DeepEqual(id, uniqueIDs[len(uniqueIDs)-1]) {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
+	}
+
+	if len(sampledIDs) < partitionCount {
+		p.log.Warnf("Not enough samples (%d) for %d partitions, falling back to single partition", len(sampledIDs), partitionCount)
+		return []bson.D{{}}, nil
+	}
+
+	return buildPartitionFilters(sampledIDs, partitionCount), nil
+}
+
+// buildPartitionFilters constructs contiguous range BSON filters from sorted sampled _ids
+func buildPartitionFilters(sampledIDs []interface{}, partitionCount int) []bson.D {
+	partitions := make([]bson.D, 0, partitionCount)
+	step := len(sampledIDs) / partitionCount
+
+	for i := 0; i < partitionCount; i++ {
+		if i == 0 {
+			// First partition: unbounded lower
+			endID := sampledIDs[step]
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: endID}}}})
+			continue
+		}
+
+		startID := sampledIDs[i*step]
+
+		if i == partitionCount-1 {
+			// Last partition: unbounded upper
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
+			continue
+		}
+
+		// Middle partitions: bounded both sides
+		endID := sampledIDs[(i+1)*step]
+		partitions = append(partitions, bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}, {Key: "$lt", Value: endID}}},
+		})
+	}
+
+	return partitions
+}
+
+// RecommendIDPartitioning samples the collection and recommends the best ID partitioning strategy
+func (p *CollectionPartitioner) RecommendIDPartitioning(ctx context.Context) (string, error) {
+	// Sample documents
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: p.sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return "", fmt.Errorf("failed to sample for recommendation: %w", err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	var objectIDCount int
+	var numericCount int
+	var otherCount int
+	var totalSampled int
+
+	for cursor.Next(sampleCtx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			return "", fmt.Errorf("failed to decode sample doc: %w", err)
+		}
+		totalSampled++
+		idVal, ok := doc["_id"]
+		if !ok {
+			otherCount++
+			continue
+		}
+
+		switch idVal.(type) {
+		case primitive.ObjectID:
+			objectIDCount++
+		case int, int32, int64, float64:
+			numericCount++
+		default:
+			otherCount++
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return "", fmt.Errorf("cursor error during sampling for recommendation: %w", err)
+	}
+
+	if totalSampled == 0 {
+		return "mixed", nil // Fallback/empty collection
+	}
+
+	p.log.Infof("ID partitioning analysis for %s: sampled %d docs. ObjectIDs: %d, Numerics: %d, Others: %d",
+		p.sourceCollection.Name(), totalSampled, objectIDCount, numericCount, otherCount)
+
+	if objectIDCount == totalSampled {
+		return "objectid", nil
+	} else if numericCount == totalSampled {
+		return "numeric", nil
+	} else {
+		return "mixed", nil
+	}
+}
+
+// createPartitionsGroupedByType groups document IDs by BSON type, partitions each type
+// using quantile sampling (>= 2,000 docs) or uniform range fallback (< 2,000 docs),
+// and merges the filters for different types together via $or.
+func (p *CollectionPartitioner) createPartitionsGroupedByType(ctx context.Context, partitionCount int) ([]bson.D, error) {
+	typeCounts, err := p.discoverPresentBSONTypes(ctx)
+	if err != nil {
+		p.log.Warnf("Failed to discover BSON types for partitioning (%v), falling back to legacy sampling", err)
+		return p.createPartitionsWithSampling(ctx, partitionCount)
+	}
+
+	if len(typeCounts) == 0 {
+		return []bson.D{{}}, nil
+	}
+
+	slicesPerType := make(map[string][]bson.D)
+	for tName, cnt := range typeCounts {
+		var slices []bson.D
+		var err error
+		if cnt >= 2000 {
+			slices, err = p.createQuantileSlicesForType(ctx, tName, partitionCount)
+			if err != nil || len(slices) != partitionCount {
+				p.log.Warnf("Quantile sampling failed for BSON type '%s' (err: %v), falling back to uniform slicing", tName, err)
+				slices, _ = p.createUniformSlicesForType(ctx, tName, partitionCount, cnt)
+			}
+		} else {
+			slices, _ = p.createUniformSlicesForType(ctx, tName, partitionCount, cnt)
+		}
+		if len(slices) == partitionCount {
+			slicesPerType[tName] = slices
+		}
+	}
+
+	if len(slicesPerType) == 0 {
+		return []bson.D{{}}, nil
+	}
+
+	return mergeTypeSlices(slicesPerType, partitionCount), nil
+}
+
+// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field using DiscoverPresentBSONTypeCounts.
+func (p *CollectionPartitioner) discoverPresentBSONTypes(ctx context.Context) (map[string]int64, error) {
+	counts, err := DiscoverPresentBSONTypeCounts(ctx, p.sourceCollection, 2000)
+	if err != nil {
+		return nil, err
+	}
+	typeCounts := make(map[string]int64, len(counts))
+	for bType, cnt := range counts {
+		typeCounts[string(bType)] = cnt
+		p.log.Infof("Discovered present BSON type '%s' (sample count capped at 2000: %d)", bType, cnt)
+	}
+	return typeCounts, nil
+}
+
+// createQuantileSlicesForType samples documents of a specific BSON type to extract numSplits quantile slices.
+func (p *CollectionPartitioner) createQuantileSlicesForType(ctx context.Context, typeName string, numSplits int) ([]bson.D, error) {
+	sampleSize := max(1000, 64*numSplits)
+	p.log.Infof("Type-scoped sampling %d documents for BSON type '%s' into %d slices", sampleSize, typeName, numSplits)
+
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: typeName}}}}}},
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sample for type %s: %w", typeName, err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	type idDoc struct {
+		ID interface{} `bson:"_id"`
+	}
+
+	var sampledIDs []interface{}
+	for cursor.Next(sampleCtx) {
+		var doc idDoc
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("failed to decode sampled document for type %s: %w", typeName, err)
+		}
+		if doc.ID != nil {
+			sampledIDs = append(sampledIDs, doc.ID)
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error during type-scoped sampling: %w", err)
+	}
+
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if !reflect.DeepEqual(id, uniqueIDs[len(uniqueIDs)-1]) {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
+	}
+
+	if len(sampledIDs) < numSplits {
+		return nil, fmt.Errorf("not enough unique samples (%d) for %d slices of type %s", len(sampledIDs), numSplits, typeName)
+	}
+
+	return buildTypeScopedPartitionFilters(sampledIDs, numSplits, typeName), nil
+}
+
+// buildTypeScopedPartitionFilters builds numSplits range queries guarded by $type: typeName.
+func buildTypeScopedPartitionFilters(sampledIDs []interface{}, numSplits int, typeName string) []bson.D {
+	partitions := make([]bson.D, 0, numSplits)
+	if numSplits <= 0 {
+		return partitions
+	}
+	if numSplits == 1 {
+		return []bson.D{{{Key: "_id", Value: bson.D{{Key: "$type", Value: typeName}}}}}
+	}
+
+	step := len(sampledIDs) / numSplits
+
+	for i := 0; i < numSplits; i++ {
+		if i == 0 {
+			endID := sampledIDs[step]
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+			continue
+		}
+
+		startID := sampledIDs[i*step]
+
+		if i == numSplits-1 {
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$gte", Value: startID},
+				}},
+			})
+			continue
+		}
+
+		endID := sampledIDs[(i+1)*step]
+		partitions = append(partitions, bson.D{
+			{Key: "_id", Value: bson.D{
+				{Key: "$type", Value: typeName},
+				{Key: "$gte", Value: startID},
+				{Key: "$lt", Value: endID},
+			}},
+		})
+	}
+
+	return partitions
+}
+
+// createUniformSlicesForType generates deterministic uniform slices without sampling for small-count types (< 2,000 docs).
+func (p *CollectionPartitioner) createUniformSlicesForType(ctx context.Context, typeName string, numSplits int, count int64) ([]bson.D, error) {
+	if numSplits <= 1 {
+		return []bson.D{{{Key: "_id", Value: bson.D{{Key: "$type", Value: typeName}}}}}, nil
+	}
+
+	switch typeName {
+	case "number":
+		return createNumberUniformSlices(numSplits), nil
+	case "objectId":
+		slices, err := p.createObjectIdUniformSlices(ctx, numSplits)
+		if err != nil {
+			return createStringUniformSlices("objectId", numSplits), nil
+		}
+		return slices, nil
+	default:
+		return createStringUniformSlices(typeName, numSplits), nil
+	}
+}
+
+func createNumberUniformSlices(numSplits int) []bson.D {
+	slices := make([]bson.D, numSplits)
+	for i := 0; i < numSplits; i++ {
+		slices[i] = bson.D{
+			{Key: "_id", Value: bson.D{
+				{Key: "$type", Value: "number"},
+				{Key: "$mod", Value: bson.A{numSplits, i}},
+			}},
+		}
+	}
+	return slices
+}
+
+func createStringUniformSlices(typeName string, numSplits int) []bson.D {
+	slices := make([]bson.D, numSplits)
+	step := 256 / numSplits
+	if step < 1 {
+		step = 1
+	}
+
+	for i := 0; i < numSplits; i++ {
+		if i == 0 {
+			endPrefix := fmt.Sprintf("%02x", step)
+			slices[i] = bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$lt", Value: endPrefix},
+				}},
+			}
+		} else if i == numSplits-1 {
+			startPrefix := fmt.Sprintf("%02x", i*step)
+			slices[i] = bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$gte", Value: startPrefix},
+				}},
+			}
+		} else {
+			startPrefix := fmt.Sprintf("%02x", i*step)
+			endPrefix := fmt.Sprintf("%02x", (i+1)*step)
+			slices[i] = bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$gte", Value: startPrefix},
+					{Key: "$lt", Value: endPrefix},
+				}},
+			}
+		}
+	}
+	return slices
+}
+
+func (p *CollectionPartitioner) createObjectIdUniformSlices(ctx context.Context, numSplits int) ([]bson.D, error) {
+	var minDoc, maxDoc bson.M
+	err := p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}})).Decode(&minDoc)
+	if err != nil {
+		return nil, err
+	}
+	err = p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}})).Decode(&maxDoc)
+	if err != nil {
+		return nil, err
+	}
+
+	minID, ok1 := minDoc["_id"].(primitive.ObjectID)
+	maxID, ok2 := maxDoc["_id"].(primitive.ObjectID)
+	if !ok1 || !ok2 || minID == maxID {
+		return nil, fmt.Errorf("invalid or identical min/max ObjectID")
+	}
+
+	minTime := minID.Timestamp()
+	maxTime := maxID.Timestamp()
+	timeRange := maxTime.Sub(minTime)
+	partitionDuration := timeRange / time.Duration(numSplits)
+
+	slices := make([]bson.D, 0, numSplits)
+	for i := 0; i < numSplits; i++ {
+		startTime := minTime.Add(partitionDuration * time.Duration(i))
+		startID := primitive.NewObjectIDFromTimestamp(startTime)
+
+		var endTime time.Time
+		if i == numSplits-1 {
+			endTime = maxTime.Add(time.Second)
+		} else {
+			endTime = minTime.Add(partitionDuration * time.Duration(i+1))
+		}
+		endID := primitive.NewObjectIDFromTimestamp(endTime)
+
+		if i == 0 {
+			slices = append(slices, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: "objectId"},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		} else if i == numSplits-1 {
+			slices = append(slices, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: "objectId"},
+					{Key: "$gte", Value: startID},
+				}},
+			})
+		} else {
+			slices = append(slices, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: "objectId"},
+					{Key: "$gte", Value: startID},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		}
+	}
+	return slices, nil
+}
+
+// mergeTypeSlices combines the i-th slice of every BSON type into an $or query for partition i.
+// If only one BSON type exists, the $or wrapper is omitted.
+func mergeTypeSlices(slicesPerType map[string][]bson.D, numSplits int) []bson.D {
+	var types []string
+	for t := range slicesPerType {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+
+	result := make([]bson.D, numSplits)
+	for i := 0; i < numSplits; i++ {
+		if len(types) == 1 {
+			t := types[0]
+			if i < len(slicesPerType[t]) {
+				result[i] = slicesPerType[t][i]
+			} else {
+				result[i] = bson.D{}
+			}
+			continue
+		}
+
+		var orClauses []bson.D
+		for _, t := range types {
+			slices := slicesPerType[t]
+			if i < len(slices) && len(slices[i]) > 0 {
+				orClauses = append(orClauses, slices[i])
+			}
+		}
+
+		if len(orClauses) == 1 {
+			result[i] = orClauses[0]
+		} else if len(orClauses) > 1 {
+			orArray := make(bson.A, len(orClauses))
+			for idx, clause := range orClauses {
+				orArray[idx] = clause
+			}
+			result[i] = bson.D{{Key: "$or", Value: orArray}}
+		} else {
+			result[i] = bson.D{}
+		}
+	}
+	return result
+}
+

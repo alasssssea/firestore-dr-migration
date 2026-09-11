@@ -1,0 +1,40 @@
+# ---- 编译产物 ----
+# 只忽略仓库根目录下的二进制，不能写成裸名字，否则会连带忽略同名源码目录。
+/fsdr
+/migrate
+*.exe
+*.test
+*.out
+
+# ---- 含真实凭据的配置（只提交 *.example.json 模板）----
+firestore_dr_config.json
+# 如果你在 sample_config.json / mongodb_replication_config.json 里填了真实连接串，
+# 建议改用自己的私有文件名并在此忽略，例如：
+# my_config.json
+
+# ---- 迁移运行时状态（断点续传 / 检查点，勿提交）----
+resumeToken-*.json
+resumeToken-*.json.*
+oplogTimestamp-*.json
+oplogTimestamp-*.json.backup
+initialMigrationState-*.json
+id-mapping.jsonl
+
+# ---- 死信队列 / 评估修复审计 / 修复计划 ----
+dlq-*.jsonl
+remediation-audit.jsonl
+remediation-plan.json
+remediation-plan.json.bak-*
+
+# ---- 日志 / 进程文件 ----
+*.log
+console-*.log
+*.pid
+
+# ---- 系统 / 编辑器杂项 ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
