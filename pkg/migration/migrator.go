@@ -118,6 +118,7 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 
 	if mode == "migrate" || mode == "retry-dlq" {
 		// Migrate mode: process each database pair sequentially
+		var pairErrors []string
 		for i, pair := range m.config.DatabasePairs {
 			m.log.Infof("Processing database pair %d/%d", i+1, len(m.config.DatabasePairs))
 			if err := m.processDatabasePair(ctx, pair, i, mode); err != nil {
@@ -127,7 +128,13 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 				}
 				m.log.Errorf("Error processing database pair %d: %v", i+1, err)
 				m.reportPairError(pair.Source.Database, err)
+				pairErrors = append(pairErrors, fmt.Sprintf("pair %d (%s): %v", i+1, pair.Source.Database, err))
 			}
+		}
+		// Never report success when a pair failed: that message previously printed
+		// unconditionally, masking dropped partitions / data loss as a clean run.
+		if len(pairErrors) > 0 {
+			return fmt.Errorf("migration finished with errors in %d database pair(s): %s", len(pairErrors), strings.Join(pairErrors, "; "))
 		}
 		if mode == "retry-dlq" {
 			m.log.Info("DLQ reprocessing completed successfully")
@@ -302,6 +309,13 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	if mode == "migrate" {
 		// For migrate mode, use a wait group to process collections in parallel
 		var wg sync.WaitGroup
+		// Collect collection-level failures so a failed collection fails the whole
+		// pair instead of being silently swallowed. Without this, a partition that
+		// blew Firestore's 128 MiB limit (or any other read error) was only logged
+		// while the run still reported "Migration completed successfully" — hiding
+		// real data loss. Guarded by a mutex: the goroutines below write concurrently.
+		var failMu sync.Mutex
+		var failedCollections []string
 		// Create a semaphore to limit concurrency
 		// Use the dedicated parameter for concurrent collections
 		concurrentCollections := m.config.ConcurrentCollections
@@ -342,8 +356,14 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 						// Don't report as an error
 					} else {
 						m.log.Errorf("Error migrating collection %s: %v", collConfig.SourceCollection, err)
+						// Record the failure so the pair does not report success.
+						// We still continue with the other collections so one bad
+						// collection does not abort the whole run, but the run must
+						// end in a failed state so the loss is never hidden.
+						failMu.Lock()
+						failedCollections = append(failedCollections, collConfig.SourceCollection)
+						failMu.Unlock()
 					}
-					// Continue with other collections even if one fails
 				}
 			}(collConfig)
 		}
@@ -365,6 +385,19 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 				}
 			})
 			deferredIdx.BuildNow(ctx)
+		}
+
+		// A collection that failed above (e.g. a read that blew the 128 MiB limit
+		// beyond what the page-shrink backstop could recover) must fail the pair.
+		// Reporting success here would silently hide missing documents.
+		if len(failedCollections) > 0 {
+			if cerr := sourceDB.Close(ctx); cerr != nil {
+				m.log.Errorf("Error closing source MongoDB connection: %v", cerr)
+			}
+			if cerr := targetDB.Close(ctx); cerr != nil {
+				m.log.Errorf("Error closing target MongoDB connection: %v", cerr)
+			}
+			return fmt.Errorf("migration failed for %d collection(s): %v", len(failedCollections), failedCollections)
 		}
 	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
@@ -602,7 +635,18 @@ func (m *Migrator) effectivePartitioning(dbName, collName string) (parallelEnabl
 // (each active partition uses ~workersPerPart write connections) and capped so a
 // huge collection cannot spawn unbounded concurrency.
 func partitionConcurrency(targetMaxPool, workersPerPart, numPartitions int) int {
-	const hardCap = 16
+	// Concurrency here is a THROUGHPUT knob, not a correctness one. Firestore's
+	// 128 MiB query-memory ceiling is enforced strictly PER QUERY, not against a
+	// shared instance budget: measured directly, 8 simultaneous keyset range-sort
+	// walks over big_events ran with ZERO blows and scaled linearly (~94k docs/s
+	// aggregate). The 128 MiB blows that plagued earlier runs were NOT caused by
+	// read concurrency — they came from the resume path issuing the
+	// {_id:{$exists:false}} "skip" sentinel as a real query (an unindexable
+	// predicate that forces a full-collection materialization; see readPartition's
+	// skip guard). With that fixed, bounded partition concurrency is safe and
+	// desirable. This cap only keeps a huge partition count from exhausting the
+	// target connection pool (each active partition uses ~workersPerPart writers).
+	const hardCap = 8
 	if workersPerPart < 1 {
 		workersPerPart = 1
 	}
@@ -621,6 +665,107 @@ func partitionConcurrency(targetMaxPool, workersPerPart, numPartitions int) int 
 		c = numPartitions
 	}
 	return c
+}
+
+// keysetAndPageFilter is the SAFE-but-slow keyset page filter: it ANDs the
+// partition filter (any shape) with a separate _id>lastReadID clause. It is
+// always correct, but on Firestore's MongoDB-compatible endpoint two separate
+// _id predicates in one $and defeat the _id index — the planner degrades into a
+// full range scan + in-memory sort (measured ~68x slower at limit 1 than a
+// single merged predicate, and the direct cause of the 128 MiB blow under read
+// concurrency). Used only as the fallback for filter shapes mergeKeysetPageFilter
+// cannot safely rewrite.
+func keysetAndPageFilter(filter bson.D, lastReadID interface{}) bson.D {
+	return bson.D{{Key: "$and", Value: bson.A{filter, bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastReadID}}}}}}}
+}
+
+// mergeKeysetPageFilter folds the keyset lower bound (_id > lastReadID) INTO the
+// partition's own _id predicate, producing a single contiguous _id range like
+// {_id: {$gt: lastReadID, $lt: partitionEnd}}. A single _id predicate lets the
+// endpoint serve the page straight from the _id index instead of the pathological
+// two-predicate $and, which is what keeps the sort buffer bounded and avoids the
+// 128 MiB blow. It only rewrites the simple single-`_id`-condition partition shape
+// the partitioner emits for a uniform-type collection; for anything else (e.g. a
+// multi-type $or partition, or an _id condition carrying operators other than the
+// range bounds) it falls back to the always-correct AND form. Dropping the
+// partition's own lower bound ($gt/$gte) is safe because lastReadID has already
+// advanced at or past it (the first page, before any read, still uses the raw
+// partition filter).
+func mergeKeysetPageFilter(filter bson.D, lastReadID interface{}) bson.D {
+	if len(filter) != 1 || filter[0].Key != "_id" {
+		return keysetAndPageFilter(filter, lastReadID)
+	}
+	cond, ok := filter[0].Value.(bson.D)
+	if !ok {
+		return keysetAndPageFilter(filter, lastReadID)
+	}
+	merged := bson.D{{Key: "$gt", Value: lastReadID}}
+	for _, c := range cond {
+		switch c.Key {
+		case "$lt", "$lte":
+			merged = append(merged, c) // keep the partition's upper bound
+		case "$gt", "$gte":
+			// superseded by $gt:lastReadID; drop to keep a single contiguous range
+		default:
+			// $exists/$type/etc.: not a plain range, not safe to merge
+			return keysetAndPageFilter(filter, lastReadID)
+		}
+	}
+	return bson.D{{Key: "_id", Value: merged}}
+}
+
+// idRangeBounds describes a partition filter of the simple contiguous-_id-range
+// form {_id: {$gt|$gte: lower, $lt|$lte: upper}} (either bound optional). ok is
+// false for any filter that is NOT a pure _id range — e.g. one carrying $type,
+// $exists, a $or of type clauses, or a non-_id top-level key — in which case the
+// caller must use the legacy both-bounds page filter.
+type idRangeBounds struct {
+	lower          interface{}
+	hasLower       bool
+	lowerInclusive bool // true for $gte
+	upper          interface{}
+	hasUpper       bool
+	upperInclusive bool // true for $lte
+	ok             bool
+}
+
+// parseIDRangeBounds extracts the contiguous-_id-range bounds from a partition
+// filter so the keyset walk can query with an OPEN lower bound and enforce the
+// upper bound CLIENT-SIDE. This is the fix for the endgame 128 MiB blow: on
+// Firestore's MongoDB-compatible endpoint a TWO-bounded _id query whose limit
+// exceeds the number of documents remaining in the range materializes far more
+// than the range and blows the 128 MiB ceiling (verified: {$gt:a,$lt:b} with
+// limit 4096 over a ~100-doc range blows, while either bound alone is clean).
+// Every partition's final page(s) hit exactly that shape, so instead we issue an
+// open {_id:{$gt:lastReadID}} query (always index-served and clean) and stop when
+// a decoded _id reaches the upper bound. Only the plain-range shape is converted;
+// anything exotic returns ok=false and keeps the safe legacy path.
+func parseIDRangeBounds(filter bson.D) idRangeBounds {
+	var b idRangeBounds
+	if len(filter) != 1 || filter[0].Key != "_id" {
+		return b
+	}
+	cond, isD := filter[0].Value.(bson.D)
+	if !isD || len(cond) == 0 {
+		return b
+	}
+	for _, c := range cond {
+		switch c.Key {
+		case "$gt":
+			b.lower, b.hasLower, b.lowerInclusive = c.Value, true, false
+		case "$gte":
+			b.lower, b.hasLower, b.lowerInclusive = c.Value, true, true
+		case "$lt":
+			b.upper, b.hasUpper, b.upperInclusive = c.Value, true, false
+		case "$lte":
+			b.upper, b.hasUpper, b.upperInclusive = c.Value, true, true
+		default:
+			// $type / $exists / anything else: not a pure range.
+			return idRangeBounds{}
+		}
+	}
+	b.ok = true
+	return b
 }
 
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
@@ -1185,18 +1330,53 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	// Byte-aware partition sizing. Firestore's MongoDB-compatible endpoint caps a
 	// single query at 128 MiB of memory, so partitions must be sized by BYTES, not
 	// by a static document-count knob: estimate the average document size and split
-	// so each partition's scan stays under the per-partition budget (64 MiB). This
-	// is the single count reused for both the checkpoint arity (expectedPartitions)
-	// and the actual split (SetForcedPartitionCount on the partitioners below), so
-	// the two can never drift.
+	// so each partition's scan stays under the per-partition budget. This is the
+	// single count reused for both the checkpoint arity (expectedPartitions) and the
+	// actual split (SetForcedPartitionCount on the partitioners below), so the two
+	// can never drift.
+	//
+	// Partition size is the PRIMARY control on per-query sort memory. This endpoint's
+	// range-sort (find(_id in [start,end)).sort(_id:1)) materializes the whole matched
+	// _id RANGE in memory to order it — the .limit() does NOT bound that buffer — so a
+	// query's memory scales with the PARTITION's byte span, not the page size. Large
+	// partitions therefore blow the 128 MiB ceiling under concurrency no matter how
+	// small the page is; small partitions keep every sort buffer small. We size each
+	// partition to a small byte budget and rely on there being many of them (bounded
+	// read concurrency, below, keeps the aggregate in check). SampleSize must be large
+	// enough to yield this many partition boundaries.
+	//
+	// avgDocSize is floored at a realistic minimum before it feeds the sizing math.
+	// EstimateAvgDocSize reads Firestore's collStats.avgObjSize / a $sample, which on
+	// this endpoint was observed to UNDER-report by ~2x (estimated ~483 B while the
+	// live backfill measured 1024 B/doc). Undercounting makes partitions too large and
+	// is exactly what blew the limit under concurrency, so we never size against an
+	// estimate below the measured floor.
+	const sortSafePartitionBudgetBytes int64 = 8 << 20
+	const minAvgDocSizeForSizing int64 = 1024
 	avgDocSize := EstimateAvgDocSize(ctx, sourceCollection, m.config.SampleSize, m.log)
-	byteAwareCount, capOverridden := partition.CountByBytes(totalCount, avgDocSize, partition.DefaultPartitionBudgetBytes, maxParts)
+	if avgDocSize < minAvgDocSizeForSizing {
+		avgDocSize = minAvgDocSizeForSizing
+	}
+	byteAwareCount, capOverridden := partition.CountByBytes(totalCount, avgDocSize, sortSafePartitionBudgetBytes, maxParts)
 	if capOverridden {
 		m.log.Warnf("[%s.%s] maxReadPartitions=%d is below the %d partitions needed to keep each partition under Firestore's 128 MiB query limit (%d docs, ~%d bytes/doc); overriding to %d for safety",
 			sourceDB.GetDatabaseName(), collConfig.SourceCollection, maxParts, byteAwareCount, totalCount, avgDocSize, byteAwareCount)
 	}
+	// The partitioner derives boundaries by stepping through SampleSize sampled _ids;
+	// it needs several samples per partition or the integer step collapses to 0 and
+	// every partition gets identical (overlapping) boundaries — which would re-scan
+	// some ranges and, worse, skip others. Byte-safe sizing wants MANY small
+	// partitions, so guard the invariant: if the byte-safe count approaches the sample
+	// budget, clamp it and warn loudly that SampleSize should be raised. Clamping makes
+	// partitions larger (closer to the 128 MiB risk), so this is a signal to fix config,
+	// not a silent fallback.
+	if maxSafePartitions := m.config.SampleSize / 2; maxSafePartitions >= 1 && byteAwareCount > maxSafePartitions {
+		m.log.Warnf("[%s.%s] byte-safe partitioning wants %d partitions but SampleSize=%d only supports ~%d; clamping to %d. RAISE sampleSize (>= 2x the desired partition count) to keep partitions small enough for Firestore's 128 MiB limit under load",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, byteAwareCount, m.config.SampleSize, maxSafePartitions, maxSafePartitions)
+		byteAwareCount = maxSafePartitions
+	}
 	m.log.Infof("[%s.%s] Byte-aware partitioning: %d docs, ~%d bytes/doc, %d MiB/partition budget => %d partitions",
-		sourceDB.GetDatabaseName(), collConfig.SourceCollection, totalCount, avgDocSize, partition.DefaultPartitionBudgetBytes>>20, byteAwareCount)
+		sourceDB.GetDatabaseName(), collConfig.SourceCollection, totalCount, avgDocSize, sortSafePartitionBudgetBytes>>20, byteAwareCount)
 
 	// This byte-aware count is authoritative for both checkpoint arity and the
 	// partitioner split.
@@ -1509,55 +1689,108 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				close(partitionDoneChan)
 			}()
 
-			// Process documents and create batches. The read is wrapped in a
-			// recursive helper so that if a range scan hits Firestore's 128 MiB
-			// per-query memory limit, we bisect that range by _id and retry each
-			// half instead of failing the whole migration. Byte-aware partition
-			// sizing keeps us under the limit; this is the safety net for
-			// document-size skew that a partition's average size did not predict.
+			// Process documents and create batches via keyset (seek) pagination.
+			// Firestore's MongoDB-compatible endpoint buffers a query's full result
+			// in memory and rejects any single query that would exceed its 128 MiB
+			// ceiling, so we never issue one unbounded range scan over a partition.
+			// Instead we walk the partition's _id range in bounded pages: each query
+			// is find(range ∧ _id > lastReadID).sort(_id:1).limit(pageSize). The sort
+			// is mandatory — without it this endpoint does NOT return an _id-range
+			// scan in _id order, which would make keyset seeking skip documents. The
+			// sort's cost is that the endpoint materializes the scanned range in
+			// memory, so correctness against the 128 MiB limit rests on the range
+			// being small: partitions are sized (below) so a whole partition sorts
+			// well under the limit, and the page-shrink backstop halves pageSize on
+			// any residual blow. Seeking past the last _id read means a page that
+			// fails part-way is retried from exactly where it stopped, never
+			// re-emitting a buffered document.
 			var batch []interface{}
 			var batchCount int
+			var lastReadID interface{}
+			var haveLast bool
 
-			var readRange func(rangeFilter bson.D, depth int) error
-			readRange = func(rangeFilter bson.D, depth int) error {
-				// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic
-				// traversal order within the partition. The resumption filter uses $gte on the
-				// last checkpointed _id, so correct ordering is required to avoid skips or
-				// duplicates on resume. [Firestore compat] noCursorTimeout is rejected by
-				// Firestore's MongoDB-compatible endpoint; omit it.
-				cursor, err := sourceCollection.Find(ctx, rangeFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(m.config.InitialReadBatchSize)))
-				if err != nil {
-					return fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err)
+			// Parse the partition's _id range once. When it is a plain contiguous
+			// range (the common case), the keyset walk queries with an OPEN lower
+			// bound and enforces the upper bound CLIENT-SIDE (pageReachedEnd), which
+			// avoids the two-bounded endgame query that blows Firestore's 128 MiB
+			// limit. Exotic filters ($type/$or/$exists) keep the legacy both-bounds
+			// page filter + page-shrink backstop.
+			bounds := parseIDRangeBounds(filter)
+			var pageReachedEnd bool // set by readPage when the upper bound is reached
+
+			// Page size in documents. The page is the PRIMARY control on per-query
+			// memory now: each keyset query sorts and buffers at most this many bytes'
+			// worth of documents, so with bounded read concurrency the aggregate stays
+			// far under Firestore's 128 MiB ceiling (e.g. 4 MiB/page * 8 concurrent
+			// partitions ~= 32 MiB). Sized against the floored avg-doc-size; the
+			// halving retry and floor back-off below cover byte-heavy regions the
+			// estimate still misses.
+			const pageBudgetBytes int64 = 4 << 20
+			pageSize := pageBudgetBytes / avgDocSize
+			if pageSize < 1000 {
+				pageSize = 1000
+			}
+			if pageSize > 50000 {
+				pageSize = 50000
+			}
+
+			// readPage reads up to pageSize documents matching pageFilter in _id
+			// order, batching them out to the workers. It reports how many documents
+			// it emitted and whether it stopped because the query hit the 128 MiB
+			// memory limit (memLimited), so the driver can shrink pageSize and retry
+			// the unread remainder. [Firestore compat] noCursorTimeout is rejected by
+			// the endpoint; omit it.
+			readPage := func(pageFilter bson.D, pageSize int64) (emitted int, memLimited bool, err error) {
+				// [Firestore compat] SetSort(_id) is REQUIRED for keyset correctness:
+				// an unsorted _id-range scan does NOT come back in _id order on this
+				// endpoint (verified — sessions/products returned descending pairs),
+				// which would make _id>lastReadID seeking skip data. The sort's cost
+				// is that the endpoint materializes the scanned range in memory, so a
+				// too-dense partition blows the 128 MiB limit; we keep that bounded by
+				// sizing partitions small enough to sort whole (see the partition
+				// budget where this collection is split) and by the page-shrink
+				// backstop below. The decode loop still asserts ascending order as a
+				// cheap defense-in-depth against any future regression.
+				cursor, cerr := sourceCollection.Find(ctx, pageFilter, options.Find().
+					SetSort(bson.D{{Key: "_id", Value: 1}}).
+					SetLimit(pageSize).
+					SetBatchSize(int32(m.config.InitialReadBatchSize)))
+				if cerr != nil {
+					// [Firestore compat] The 128 MiB memory-limit error can surface
+					// HERE, at cursor creation, not only during iteration: the driver
+					// executes the query (and fetches the first batch) eagerly, so a
+					// page that over-buffers fails Find() itself. This path must report
+					// memLimited exactly like the cursor.Err() path below, otherwise
+					// the page-shrink backstop never runs and the whole partition is
+					// abandoned (silent data loss).
+					if isQueryMemoryLimitError(cerr) {
+						return 0, true, cerr
+					}
+					return 0, false, fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, cerr)
 				}
-				// [Safety Fix 5: Memory Leak on Server] Ensure the cursor is closed to prevent
-				// server-side resource leakage, including on the sub-split recursion path.
+				// [Safety Fix 5: Memory Leak on Server] Ensure the cursor is closed to
+				// prevent server-side resource leakage on every page.
 				defer cursor.Close(ctx)
 
-				// Track the last _id read in this range so a 128 MiB failure part-way
-				// through can re-read only the unread remainder ($id > lastReadID),
-				// never re-emitting an already-buffered document.
-				var lastReadID interface{}
-				var readAny bool
 				for {
 					// Check for errors from workers
 					select {
-					case err := <-partitionErrorChan:
-						return err
+					case werr := <-partitionErrorChan:
+						return emitted, false, werr
 					default:
 						// No errors, continue processing
 					}
 
 					// Get next document
 					readStart := time.Now()
-					hasNext := cursor.Next(ctx)
-					if !hasNext {
+					if !cursor.Next(ctx) {
 						break
 					}
 
 					// Decode document
 					var doc bson.D
-					if err := cursor.Decode(&doc); err != nil {
-						return fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, err)
+					if decErr := cursor.Decode(&doc); decErr != nil {
+						return emitted, false, fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, decErr)
 					}
 					readDuration := time.Since(readStart)
 
@@ -1565,13 +1798,57 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 						opts.BackfillStatsManager.RecordRead(bfNS, readDuration, len(cursor.Current))
 					}
 
+					// Advance the keyset cursor position AND prove the scan is
+					// strictly ascending in _id. Keyset seeking (_id > lastReadID) is
+					// only correct if each page arrives in ascending _id order; the
+					// server-side sort above guarantees that, and this per-document
+					// assertion is cheap defense-in-depth. It is not paranoia: an
+					// UNSORTED scan on this endpoint was observed returning descending
+					// _id pairs, which would silently skip every document between an
+					// out-of-order pair. So if ordering is ever violated (or an _id is
+					// of a type we cannot compare) we FAIL LOUD rather than lose data.
+					if id, ok := bsonIDValue(doc); ok {
+						// CLIENT-SIDE upper bound. Keyset pages query with an open
+						// lower bound (no $lt), so the cursor keeps returning _ids past
+						// this partition's end (into the next partition's territory).
+						// Stop at the boundary WITHOUT emitting the boundary document:
+						// partitions are half-open [start, end), so an _id == end (or
+						// beyond) belongs to the next partition and is read there. This
+						// is what makes the open-lower query safe — no doc is skipped or
+						// double-migrated.
+						if bounds.ok && bounds.hasUpper {
+							if cmp, cok := compareBSONID(id, bounds.upper); cok {
+								past := cmp >= 0
+								if bounds.upperInclusive {
+									past = cmp > 0
+								}
+								if past {
+									pageReachedEnd = true
+									break
+								}
+							} else {
+								return emitted, false, fmt.Errorf("partition %d: cannot compare _id to partition upper bound (got %T vs %T); aborting to avoid silent data loss", partitionIndex, id, bounds.upper)
+							}
+						}
+						if haveLast {
+							cmp, cok := compareBSONID(id, lastReadID)
+							if !cok {
+								return emitted, false, fmt.Errorf("partition %d: cannot compare _id types to verify scan order (got %T after %T); refusing to continue unsorted keyset read to avoid silent data loss", partitionIndex, id, lastReadID)
+							}
+							if cmp <= 0 {
+								return emitted, false, fmt.Errorf("partition %d: unsorted range scan returned _id out of ascending order (%v after %v); aborting to avoid skipping documents", partitionIndex, id, lastReadID)
+							}
+						}
+						lastReadID = id
+						haveLast = true
+					} else {
+						return emitted, false, fmt.Errorf("partition %d: document has no _id; cannot keyset-page safely", partitionIndex)
+					}
+
 					// Add to batch
 					batch = append(batch, doc)
 					batchCount++
-					if id, ok := bsonIDValue(doc); ok {
-						lastReadID = id
-						readAny = true
-					}
+					emitted++
 
 					if batchCount >= m.config.InitialWriteBatchSize {
 						seq := tracker.RegisterBatch(batch)
@@ -1583,12 +1860,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 								opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
 							}
 							// Batch sent to worker
-						case err := <-partitionErrorChan:
+						case werr := <-partitionErrorChan:
 							// Error from a worker
-							return err
+							return emitted, false, werr
 						case <-ctx.Done():
 							// Context cancelled
-							return ctx.Err()
+							return emitted, false, ctx.Err()
 						}
 
 						// Reset batch
@@ -1598,38 +1875,127 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				}
 
 				// Check for cursor errors
-				if err := cursor.Err(); err != nil {
-					// [128 MiB fallback] Firestore rejects a range-scan+sort that would exceed
-					// its 128 MiB query-memory ceiling. This can fire before the first document
-					// OR part-way through (on a later getMore), so we do NOT assume zero were
-					// emitted: everything with _id <= lastReadID is already buffered, and we
-					// re-read only the unread remainder ($id > lastReadID), bisected so each
-					// half stays under the limit. Reading is _id-ascending, so this can never
-					// re-emit a buffered document.
-					if isQueryMemoryLimitError(err) && depth < maxSubsplitDepth {
-						remaining := rangeFilter
-						if readAny {
-							remaining = bson.D{{Key: "$and", Value: bson.A{rangeFilter, bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastReadID}}}}}}}
-						}
-						if splitID, ok := findPartitionSplitID(ctx, sourceCollection, remaining, m.config.SampleSize, m.log); ok {
-							m.log.Warnf("[%s.%s] partition %d hit Firestore's 128 MiB query limit at depth %d; bisecting the remaining _id range and retrying each half",
-								sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, depth)
-							loFilter := bson.D{{Key: "$and", Value: bson.A{remaining, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: splitID}}}}}}}
-							hiFilter := bson.D{{Key: "$and", Value: bson.A{remaining, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: splitID}}}}}}}
-							if lerr := readRange(loFilter, depth+1); lerr != nil {
-								return lerr
-							}
-							return readRange(hiFilter, depth+1)
-						}
-						m.log.Warnf("[%s.%s] partition %d hit the 128 MiB limit but no split point could be found; not subsplitting",
-							sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex)
+				if cerr := cursor.Err(); cerr != nil {
+					if isQueryMemoryLimitError(cerr) {
+						return emitted, true, cerr
 					}
-					return fmt.Errorf("cursor error in partition %d: %w", partitionIndex, err)
+					return emitted, false, fmt.Errorf("cursor error in partition %d: %w", partitionIndex, cerr)
 				}
-				return nil
+				return emitted, false, nil
 			}
 
-			if err := readRange(filter, 0); err != nil {
+			// Drive the keyset walk: page through the partition until a short page
+			// signals the range is exhausted, shrinking pageSize on any 128 MiB hit.
+			// The page-shrink handles byte-heavy regions; the floor-retry below
+			// handles the residual case where even a single-document sort blows,
+			// which cannot be a real per-query size problem and is therefore a
+			// transient shared-memory-pressure blow (see partitionConcurrency).
+			const maxFloorRetries = 8
+			const floorRecoverPageSize int64 = 1000
+			floorRetries := 0
+			readPartition := func() error {
+				// A partition whose filter is the "skip" sentinel ({_id:{$exists:false}})
+				// has already been fully migrated in a prior run (the resume planner
+				// emits this for completed partitions). It must NOT be executed as a
+				// query: on Firestore's MongoDB-compatible endpoint {_id:{$exists:false}}
+				// cannot use the _id index (a "field is absent" predicate is
+				// unindexable), so the endpoint scans and materializes the ENTIRE
+				// collection and blows the 128 MiB query-memory limit — even at limit 1
+				// and even with no sort (verified). Skipping the read entirely is both
+				// correct (the partition is done, zero documents remain) and the fix for
+				// the resume-path 128 MiB blow.
+				if IsFilterSkipped(filter) {
+					m.log.Debugf("[%s.%s] partition %d already complete (skip sentinel); no read issued",
+						sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex)
+					return nil
+				}
+				for {
+					// Build the page filter. Fast path (bounds.ok): an OPEN
+					// lower-bound query with NO upper bound — {_id:{$gt:lastReadID}}
+					// once we have read a document, else the partition's own lower
+					// bound (or {} for a partition that starts at the collection
+					// minimum). The upper bound is enforced client-side in readPage.
+					// This is what avoids the two-bounded endgame 128 MiB blow. Legacy
+					// path (exotic filter): the merged both-bounds filter + page-shrink.
+					var pageFilter bson.D
+					if bounds.ok {
+						switch {
+						case haveLast:
+							pageFilter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastReadID}}}}
+						case bounds.hasLower && bounds.lowerInclusive:
+							pageFilter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: bounds.lower}}}}
+						case bounds.hasLower:
+							pageFilter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: bounds.lower}}}}
+						default:
+							pageFilter = bson.D{} // partition starts at collection min
+						}
+					} else {
+						pageFilter = filter
+						if haveLast {
+							pageFilter = mergeKeysetPageFilter(filter, lastReadID)
+						}
+					}
+
+					pageReachedEnd = false
+					emitted, memLimited, err := readPage(pageFilter, pageSize)
+					if err != nil {
+						if memLimited && pageSize > 1 {
+							newSize := pageSize / 2
+							if newSize < 1 {
+								newSize = 1
+							}
+							m.log.Warnf("[%s.%s] partition %d hit Firestore's 128 MiB query limit; shrinking page size %d -> %d and retrying the unread remainder",
+								sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, pageSize, newSize)
+							pageSize = newSize
+							continue
+						}
+						if memLimited && pageSize == 1 {
+							// A one-document sort cannot legitimately need 128 MiB, so
+							// this is transient pressure from other concurrent sorts on
+							// the shared endpoint. Back off (giving peers time to finish
+							// and release memory) and retry the SAME single-doc page.
+							// Keyset seeking means the retry resumes exactly where we
+							// stopped, never re-emitting a document.
+							if floorRetries < maxFloorRetries {
+								floorRetries++
+								backoff := time.Duration(1<<uint(floorRetries-1)) * time.Second
+								if backoff > 5*time.Second {
+									backoff = 5 * time.Second
+								}
+								m.log.Warnf("[%s.%s] partition %d hit the 128 MiB limit even at page size 1 (transient concurrent-memory pressure); backing off %s and retrying (%d/%d)",
+									sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, backoff, floorRetries, maxFloorRetries)
+								select {
+								case <-time.After(backoff):
+								case <-ctx.Done():
+									return ctx.Err()
+								}
+								continue
+							}
+							return fmt.Errorf("partition %d: Firestore's 128 MiB query limit persists at page size 1 after %d back-off retries: %w", partitionIndex, maxFloorRetries, err)
+						}
+						return err
+					}
+
+					// The partition is exhausted when either we reached its upper
+					// bound client-side (fast path), or a page came back shorter than
+					// the limit it was issued with (end of the collection, or the
+					// legacy both-bounds range ran out). The short-page check MUST use
+					// the page size actually issued, before any recovery rewrites it.
+					if pageReachedEnd || int64(emitted) < pageSize {
+						return nil
+					}
+
+					// A full page succeeded: clear the transient-blow counter. If we had
+					// crawled down to a tiny page, recover to a modest size so the rest
+					// of a large partition does not read one document at a time.
+					floorRetries = 0
+					if pageSize < floorRecoverPageSize {
+						pageSize = floorRecoverPageSize
+					}
+				}
+			}
+
+			if err := readPartition(); err != nil {
 				close(partitionBatchChan)
 				errorChan <- err
 				return

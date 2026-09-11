@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"reflect"
@@ -17,18 +18,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// maxSubsplitDepth caps how many times a single read partition may be bisected
-// when it keeps hitting Firestore's 128 MiB per-query memory limit. Depth 4 turns
-// one partition into at most 16 sub-ranges, which combined with byte-aware sizing
-// is far more than enough headroom for realistic document-size skew.
-const maxSubsplitDepth = 4
-
 // isQueryMemoryLimitError reports whether err is Firestore's MongoDB-compatible
 // endpoint rejecting a query for exceeding its 128 MiB per-query memory ceiling
-// (a range scan + sort that would buffer too much fails atomically with
+// (the endpoint buffers a query's full result and fails atomically with
 // InvalidArgument: "The query failed since it attempted to use 128.00 MiB when
 // the limit is 128.00 MiB"). Matched on the stable phrasing rather than the exact
-// number so a future limit change still triggers the sub-split fallback.
+// number so a future limit change still triggers the page-shrink fallback on the
+// keyset read path.
 func isQueryMemoryLimitError(err error) bool {
 	if err == nil {
 		return false
@@ -49,71 +45,62 @@ func bsonIDValue(doc bson.D) (interface{}, bool) {
 	return nil, false
 }
 
-// findPartitionSplitID returns a concrete _id value that roughly bisects the set
-// of documents matching filter, so the caller can retry the range in two halves
-// after a 128 MiB failure. It samples _ids WITHIN the filter ($match then
-// $sample — the same shape the partitioner already relies on, and small enough to
-// stay well under the memory limit), sorts them, and returns the median. The
-// returned value is a real _id of the correct BSON type, so it can be ANDed onto
-// any filter shape ($lt/$gte range, $type-scoped, $or-merged) without the caller
-// needing to understand the _id type. Returns ok=false when the range cannot be
-// meaningfully split (fewer than two distinct sampled _ids).
-func findPartitionSplitID(ctx context.Context, coll *mongo.Collection, filter bson.D, sampleSize int, log *logger.Logger) (interface{}, bool) {
-	if sampleSize <= 0 {
-		sampleSize = 1000
+// bsonNumericToFloat coerces the numeric BSON _id types to a float64 for
+// ordering. Precision loss on very large int64s is irrelevant here: we only use
+// it to assert strict monotonicity of a keyset scan, not to compute values.
+func bsonNumericToFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case float64:
+		return n, true
+	default:
+		return 0, false
 	}
-	if sampleSize > 1000 {
-		sampleSize = 1000
-	}
+}
 
-	sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	cursor, err := coll.Aggregate(sctx, mongo.Pipeline{
-		bson.D{{Key: "$match", Value: filter}},
-		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
-		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
-		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
-	})
-	if err != nil {
-		if log != nil {
-			log.Warnf("failed to sample _id for sub-split of a partition (%v); cannot bisect", err)
+// compareBSONID orders two _id values the same way the _id index does, returning
+// -1/0/1 like bytes.Compare and ok=false when the values are not a known,
+// comparable _id type. The keyset read path uses this to PROVE that an unsorted
+// range scan really came back in ascending _id order: we dropped the server-side
+// sort (Firestore's compat endpoint materializes a sorted range in memory and
+// blows its 128 MiB limit on dense partitions), so ascending order now rests on
+// the _id index scan returning docs in index order. That is not a documented
+// guarantee, so the caller asserts monotonicity on every document and fails the
+// migration loudly on any violation rather than silently skipping data.
+// ObjectIDs are byte-comparable in the same order the index sorts them.
+func compareBSONID(a, b interface{}) (int, bool) {
+	switch av := a.(type) {
+	case primitive.ObjectID:
+		bv, ok := b.(primitive.ObjectID)
+		if !ok {
+			return 0, false
 		}
-		return nil, false
-	}
-	defer cursor.Close(sctx)
-
-	type idDoc struct {
-		ID interface{} `bson:"_id"`
-	}
-	var ids []interface{}
-	for cursor.Next(sctx) {
-		var d idDoc
-		if err := cursor.Decode(&d); err != nil {
-			continue
+		return bytes.Compare(av[:], bv[:]), true
+	case string:
+		bv, ok := b.(string)
+		if !ok {
+			return 0, false
 		}
-		if d.ID != nil {
-			ids = append(ids, d.ID)
-		}
+		return strings.Compare(av, bv), true
 	}
-	if len(ids) < 2 {
-		return nil, false
-	}
-
-	// The median makes a balanced split when _ids are uniform; recursion absorbs
-	// any residual skew. Guard against a median equal to the smallest sampled _id
-	// (heavy duplication of the low bound), which would produce an empty lower half
-	// and re-run the identical range forever.
-	mid := ids[len(ids)/2]
-	if reflect.DeepEqual(mid, ids[0]) {
-		for _, id := range ids {
-			if !reflect.DeepEqual(id, ids[0]) {
-				return id, true
+	if af, aok := bsonNumericToFloat(a); aok {
+		if bf, bok := bsonNumericToFloat(b); bok {
+			switch {
+			case af < bf:
+				return -1, true
+			case af > bf:
+				return 1, true
+			default:
+				return 0, true
 			}
 		}
-		return nil, false
 	}
-	return mid, true
+	return 0, false
 }
 
 // CollectionPartitioner handles partitioning a collection for parallel reads
@@ -278,17 +265,99 @@ func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error)
 	}
 
 	// Determine partition strategy based on strategy
+	var partitions []bson.D
+	var partErr error
 	switch strategy {
 	case "objectid":
-		return p.createObjectIDPartitionsWithSampling(ctx, partitionCount)
+		partitions, partErr = p.createObjectIDPartitionsWithSampling(ctx, partitionCount)
 	case "numeric":
-		return p.createNumericPartitionsWithSampling(ctx, partitionCount)
+		partitions, partErr = p.createNumericPartitionsWithSampling(ctx, partitionCount)
 	case "mixed", "auto", "":
-		return p.createPartitionsGroupedByType(ctx, partitionCount)
+		partitions, partErr = p.createPartitionsGroupedByType(ctx, partitionCount)
 	default:
 		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to grouped-by-type mixed mode partitioning", strategy)
-		return p.createPartitionsGroupedByType(ctx, partitionCount)
+		partitions, partErr = p.createPartitionsGroupedByType(ctx, partitionCount)
 	}
+	if partErr != nil {
+		return nil, partErr
+	}
+	// Every create* helper leaves the final partition open on the upper side
+	// ({_id:{$gte:X}}). Under continuous writes, keyset pagination would tail
+	// newly-inserted _ids in that partition forever, so backfill never completes
+	// and the change-stream/incremental phase never starts. Pin the final partition
+	// to the collection's current max _id (a snapshot ceiling); anything written
+	// past it is captured by the change stream, whose resume token predates backfill.
+	return p.capFinalPartitionUpperBound(ctx, partitions)
+}
+
+// capFinalPartitionUpperBound bounds the final open-ended partition at the
+// collection's current max _id so backfill terminates under continuous write load.
+// It only rewrites a simple {_id:{<lower ops>}} filter with no existing upper bound;
+// type-bracketed or $or partitions (mixed-type collections) are left untouched so the
+// legacy read path keeps owning them.
+func (p *CollectionPartitioner) capFinalPartitionUpperBound(ctx context.Context, partitions []bson.D) ([]bson.D, error) {
+	if len(partitions) == 0 {
+		return partitions, nil
+	}
+	last := partitions[len(partitions)-1]
+	// Expect exactly {_id: <bson.D of range ops>}.
+	if len(last) != 1 || last[0].Key != "_id" {
+		return partitions, nil
+	}
+	inner, ok := last[0].Value.(bson.D)
+	if !ok || len(inner) == 0 {
+		return partitions, nil
+	}
+	for _, cond := range inner {
+		switch cond.Key {
+		case "$lt", "$lte":
+			return partitions, nil // already upper-bounded
+		case "$type", "$or", "$in":
+			return partitions, nil // not a plain range; leave to legacy path
+		}
+	}
+	// NOTE: do NOT use FindOne(sort:{_id:-1}) here. On the Firestore MongoDB-compat
+	// endpoint a full-collection sort buffers the whole result and blows the 128 MiB
+	// per-query limit on large collections. Instead take the max _id over a bounded
+	// $sample. The sampled max sits slightly below the true max, which only means a
+	// thin sliver of the newest pre-backfill docs falls outside the backfill ceiling;
+	// those are captured by the change stream (its resume token predates backfill), so
+	// a sampled ceiling is safe and still guarantees termination under live writes.
+	sampleSize := p.sampleSize
+	if sampleSize <= 0 {
+		sampleSize = 1000
+	}
+	cur, err := p.sourceCollection.Aggregate(ctx, mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "max", Value: bson.D{{Key: "$max", Value: "$_id"}}},
+		}}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to sample max _id to bound final backfill partition: %w", err)
+	}
+	defer cur.Close(ctx)
+	var maxID interface{}
+	if cur.Next(ctx) {
+		var res bson.M
+		if derr := cur.Decode(&res); derr != nil {
+			return nil, fmt.Errorf("failed to decode sampled max _id: %w", derr)
+		}
+		maxID = res["max"]
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error sampling max _id: %w", err)
+	}
+	if maxID == nil {
+		return partitions, nil
+	}
+	bounded := make(bson.D, len(inner), len(inner)+1)
+	copy(bounded, inner)
+	bounded = append(bounded, bson.E{Key: "$lte", Value: maxID})
+	partitions[len(partitions)-1] = bson.D{{Key: "_id", Value: bounded}}
+	p.log.Infof("Bounded final backfill partition at snapshot max _id (%v) to guarantee termination under live writes", maxID)
+	return partitions, nil
 }
 
 // createObjectIDPartitionsWithSampling creates partitions based on ObjectID sampling

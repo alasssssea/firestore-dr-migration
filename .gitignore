@@ -45,3 +45,8 @@ firestore_dr_live_config.json
 # 压测器二进制(测试专用)
 loadgen
 firestore_dr_live_tuned.json
+
+# ---- 本地真实连接信息 / 归档(勿提交) ----
+firestore_dr_us-db.json
+firestore_dr_us-db2.json
+_archive/
