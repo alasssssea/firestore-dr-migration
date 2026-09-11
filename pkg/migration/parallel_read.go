@@ -38,6 +38,17 @@ func isQueryMemoryLimitError(err error) bool {
 		(strings.Contains(s, "attempted to use") && strings.Contains(s, "MiB"))
 }
 
+// bsonIDValue extracts the _id value from a decoded document. Returns ok=false
+// if the document has no _id (should not happen for real collections).
+func bsonIDValue(doc bson.D) (interface{}, bool) {
+	for _, e := range doc {
+		if e.Key == "_id" {
+			return e.Value, true
+		}
+	}
+	return nil, false
+}
+
 // findPartitionSplitID returns a concrete _id value that roughly bisects the set
 // of documents matching filter, so the caller can retry the range in two halves
 // after a 128 MiB failure. It samples _ids WITHIN the filter ($match then

@@ -1533,7 +1533,11 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				// server-side resource leakage, including on the sub-split recursion path.
 				defer cursor.Close(ctx)
 
-				var emittedThisRange int64
+				// Track the last _id read in this range so a 128 MiB failure part-way
+				// through can re-read only the unread remainder ($id > lastReadID),
+				// never re-emitting an already-buffered document.
+				var lastReadID interface{}
+				var readAny bool
 				for {
 					// Check for errors from workers
 					select {
@@ -1564,7 +1568,10 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 					// Add to batch
 					batch = append(batch, doc)
 					batchCount++
-					emittedThisRange++
+					if id, ok := bsonIDValue(doc); ok {
+						lastReadID = id
+						readAny = true
+					}
 
 					if batchCount >= m.config.InitialWriteBatchSize {
 						seq := tracker.RegisterBatch(batch)
@@ -1592,18 +1599,23 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 				// Check for cursor errors
 				if err := cursor.Err(); err != nil {
-					// [128 MiB fallback] Firestore fails a range-scan+sort atomically when it
-					// would exceed the 128 MiB query-memory ceiling, before streaming any
-					// document. If nothing was emitted from this range yet, we can safely bisect
-					// it by _id and retry each half without duplicating: ranges are read
-					// low-to-high, so a failed range (0 emitted) never overlaps documents already
-					// buffered from earlier, lower ranges.
-					if isQueryMemoryLimitError(err) && depth < maxSubsplitDepth && emittedThisRange == 0 {
-						if splitID, ok := findPartitionSplitID(ctx, sourceCollection, rangeFilter, m.config.SampleSize, m.log); ok {
-							m.log.Warnf("[%s.%s] partition %d hit Firestore's 128 MiB query limit at depth %d; bisecting the _id range and retrying each half",
+					// [128 MiB fallback] Firestore rejects a range-scan+sort that would exceed
+					// its 128 MiB query-memory ceiling. This can fire before the first document
+					// OR part-way through (on a later getMore), so we do NOT assume zero were
+					// emitted: everything with _id <= lastReadID is already buffered, and we
+					// re-read only the unread remainder ($id > lastReadID), bisected so each
+					// half stays under the limit. Reading is _id-ascending, so this can never
+					// re-emit a buffered document.
+					if isQueryMemoryLimitError(err) && depth < maxSubsplitDepth {
+						remaining := rangeFilter
+						if readAny {
+							remaining = bson.D{{Key: "$and", Value: bson.A{rangeFilter, bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastReadID}}}}}}}
+						}
+						if splitID, ok := findPartitionSplitID(ctx, sourceCollection, remaining, m.config.SampleSize, m.log); ok {
+							m.log.Warnf("[%s.%s] partition %d hit Firestore's 128 MiB query limit at depth %d; bisecting the remaining _id range and retrying each half",
 								sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, depth)
-							loFilter := bson.D{{Key: "$and", Value: bson.A{rangeFilter, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: splitID}}}}}}}
-							hiFilter := bson.D{{Key: "$and", Value: bson.A{rangeFilter, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: splitID}}}}}}}
+							loFilter := bson.D{{Key: "$and", Value: bson.A{remaining, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: splitID}}}}}}}
+							hiFilter := bson.D{{Key: "$and", Value: bson.A{remaining, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: splitID}}}}}}}
 							if lerr := readRange(loFilter, depth+1); lerr != nil {
 								return lerr
 							}
