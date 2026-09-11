@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"runtime"
 )
 
 // Config represents the main configuration structure
@@ -224,7 +223,16 @@ func ApplyDefaults(config *Config) {
 	}
 
 	if config.IncrementalWorkerCount <= 0 {
-		config.IncrementalWorkerCount = runtime.NumCPU() // Default to number of CPU cores
+		// The incremental apply workers are I/O-bound: each one spends most of its
+		// time waiting on a bulk write to the target (against a multi-region
+		// Firestore target, bulk-write latency is ~150-200ms). Sizing this to the
+		// CPU count therefore under-provisions concurrency — the right number is
+		// driven by target write latency, not cores. Empirically (single-region ->
+		// nam5), 8 workers cap apply at ~470 events/s while 48 reach ~1,800/s, so a
+		// CPU-count default badly lags production single-collection peaks
+		// (~1,000 doc-changes/s). Default to 32, which comfortably covers that peak;
+		// raise it further for higher sustained write rates (see docs/CONFIGURATION.md).
+		config.IncrementalWorkerCount = 32
 	}
 
 	if config.IncrementalIncomingQueueSize <= 0 {

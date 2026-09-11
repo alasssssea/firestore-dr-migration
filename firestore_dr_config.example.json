@@ -39,7 +39,7 @@
 
   "incrementalReadBatchSize": 8192,
   "incrementalWriteBatchSize": 128,
-  "incrementalWorkerCount": 8,
+  "incrementalWorkerCount": 32,
   "statsIntervalMinutes": 5,
 
   "parallelReadsEnabled": true,
