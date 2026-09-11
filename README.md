@@ -16,7 +16,7 @@ It is **Firestore → Firestore only**
 
 > ⚠️ **Billing**: the source database, the target database, and change streams all incur Firestore charges. Tear down demo/test resources when done.
 
-## Design constraints (this fork)
+## Design constraints
 
 - **Firestore → Firestore only.** Both endpoints are Firestore (MongoDB compatibility).
 - **Single change stream.** Firestore change streams do not support an `$expr` hash-partition stage in the watch pipeline, so `incrementalStreamPartitions` is forced to `1` (no multi-partition CDC).
