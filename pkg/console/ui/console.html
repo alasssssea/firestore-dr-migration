@@ -444,7 +444,6 @@ const I18N = {
     retryCreateBtn: `Retry create`,
     // dynamic — detect
     pillVersion: v => `Version ${v}`,
-    pillReplicaSet: v => `Replica set ${v}`,
     pillDriver: v => `Driver ${v}`,
     pillReplMethod: v => `Replication ${v}`,
     planResetMsg: `↺ Source change detected: the previous remediation plan was cleared to avoid cross-database contamination.`,
@@ -800,7 +799,6 @@ const I18N = {
     createBtnBusy: `创建中…`,
     retryCreateBtn: `重试创建`,
     pillVersion: v => `版本 ${v}`,
-    pillReplicaSet: v => `副本集 ${v}`,
     pillDriver: v => `驱动 ${v}`,
     pillReplMethod: v => `复制方式 ${v}`,
     planResetMsg: `↺ 检测到 source 变更：已清空上一次的修复计划，避免跨库串味。`,
@@ -1123,7 +1121,6 @@ async function detect(){
     const method = d.replicationMethod;
     let html = `<div style="margin-top:.6rem">`
       + `<span class="pill pill-info">${esc(t("pillVersion", d.version||"?"))}</span>`
-      + `<span class="pill ${d.isReplicaSet?"pill-ok":"pill-warn"}">${esc(t("pillReplicaSet", d.isReplicaSet))}</span>`
       + `<span class="pill pill-info">${esc(t("pillDriver", d.modernDriver?"modern":"legacy(mgo)"))}</span>`
       + `<span class="pill ${method==="oplog-legacy"?"pill-warn":"pill-ok"}">${esc(t("pillReplMethod", method))}</span></div>`;
     if(d.warning) html += `<div class="err" style="background:#3a2f14;border-color:#7c5e12;color:#fbbf24">${esc(d.warning)}</div>`;

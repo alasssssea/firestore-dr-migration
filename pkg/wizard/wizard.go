@@ -95,7 +95,7 @@ func Run(log *logger.Logger, outputPath string) error {
 		return fmt.Errorf("无法连接/检测源服务器: %w", err)
 	}
 	decision := migration.ResolveReplicationMethod(info)
-	fmt.Printf("  版本: %s  副本集: %v  复制方式: %s\n", info.Version, info.IsReplicaSet, decision.Method)
+	fmt.Printf("  版本: %s  复制方式: %s\n", info.Version, decision.Method)
 	if decision.Warning != "" {
 		fmt.Printf("  ⚠ %s\n", decision.Warning)
 	}
