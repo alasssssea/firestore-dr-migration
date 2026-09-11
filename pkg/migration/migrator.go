@@ -756,8 +756,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		m.log,
 	)
 
-	// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the MongoDB read cursor from timing out (default 10 minutes)
-	// when upstream readers are throttled or paused by write rate-limiting/backpressure downstream.
+	// [Firestore compat] Firestore's MongoDB-compatible endpoint rejects noCursorTimeout
+	// ("Unsupported fields in find request: [noCursorTimeout]"), so we must NOT set it here.
+	// Upstream used SetNoCursorTimeout(true) to keep a MongoDB replica-set cursor alive under
+	// backpressure; Firestore has no equivalent server-side cursor-timeout knob, and backfill
+	// resumption is instead guaranteed by the _id-ordered $gte checkpoint filter below.
 	findFilter := bson.D{}
 	if resumeFilter != nil {
 		findFilter = resumeFilter
@@ -765,7 +768,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic traversal order.
 	// The resumption filter uses $gte on the last checkpointed _id, so correct ordering is required
 	// to ensure no documents are skipped or duplicated upon resume.
-	cursor, err := sourceCollection.Find(ctx, findFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
+	cursor, err := sourceCollection.Find(ctx, findFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(readBatchSize)))
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create cursor: %w", err)
 	}
@@ -1378,7 +1381,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic traversal order within the partition.
 			// The resumption filter uses $gte on the last checkpointed _id, so correct ordering is required
 			// to ensure no documents are skipped or duplicated upon resume.
-			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(m.config.InitialReadBatchSize)).SetNoCursorTimeout(true))
+			// [Firestore compat] noCursorTimeout is rejected by Firestore's MongoDB-compatible endpoint; omit it.
+			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(m.config.InitialReadBatchSize)))
 			if err != nil {
 				errorChan <- fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err)
 				return
@@ -1840,7 +1844,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 			writeDuration := time.Since(writeStart)
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
-				opts.BackfillStatsManager.RecordWriteResult(bfNS,0, int64(len(batch)), 0, int64(len(batch)), workerID)
+				opts.BackfillStatsManager.RecordWriteResult(bfNS, 0, int64(len(batch)), 0, int64(len(batch)), workerID)
 			}
 			return 0, int64(len(batch)), nil
 		}
@@ -1881,7 +1885,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 						duplicateKeys = int64(len(batch))
 						m.log.Debugf("[%s.%s] Proactively skipped entire batch of %d documents (already exist)", sourceDB, sourceCollection, len(batch))
 						if opts.BackfillStatsManager != nil {
-							opts.BackfillStatsManager.RecordWriteResult(bfNS,0, 0, duplicateKeys, 0, workerID)
+							opts.BackfillStatsManager.RecordWriteResult(bfNS, 0, 0, duplicateKeys, 0, workerID)
 						}
 						return 0, 0, nil
 					} else if len(existingKeys) > 0 {
@@ -1937,7 +1941,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		if insertErr == nil {
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(bulkDuration)
-				opts.BackfillStatsManager.RecordWriteResult(bfNS,int64(len(batch)), 0, 0, 0, workerID)
+				opts.BackfillStatsManager.RecordWriteResult(bfNS, int64(len(batch)), 0, 0, 0, workerID)
 			}
 			return int64(len(batch)), 0, nil
 		}
@@ -2051,7 +2055,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 									proactiveSkipEnabled.Store(true)
 								}
 								if opts.BackfillStatsManager != nil {
-									opts.BackfillStatsManager.RecordWriteResult(bfNS,successCount, 0, duplicateKeys, 0, workerID)
+									opts.BackfillStatsManager.RecordWriteResult(bfNS, successCount, 0, duplicateKeys, 0, workerID)
 								}
 								return successCount, 0, nil
 							}
@@ -2109,7 +2113,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 
 		successCount := int64(len(batch)) - batchFailed
 		if opts.BackfillStatsManager != nil {
-			opts.BackfillStatsManager.RecordWriteResult(bfNS,successCount, batchFailed, duplicateKeys, dlqCount, workerID)
+			opts.BackfillStatsManager.RecordWriteResult(bfNS, successCount, batchFailed, duplicateKeys, dlqCount, workerID)
 		}
 		return successCount, batchFailed, nil
 	} else {
@@ -2131,13 +2135,13 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		if err != nil {
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
-				opts.BackfillStatsManager.RecordWriteResult(bfNS,0, int64(len(batch)), 0, 0, workerID)
+				opts.BackfillStatsManager.RecordWriteResult(bfNS, 0, int64(len(batch)), 0, 0, workerID)
 			}
 			return 0, int64(len(batch)), err
 		}
 		if opts.BackfillStatsManager != nil {
 			opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
-			opts.BackfillStatsManager.RecordWriteResult(bfNS,int64(len(batch)), 0, 0, 0, workerID)
+			opts.BackfillStatsManager.RecordWriteResult(bfNS, int64(len(batch)), 0, 0, 0, workerID)
 		}
 		return int64(len(batch)), 0, nil
 	}

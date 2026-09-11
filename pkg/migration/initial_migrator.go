@@ -196,10 +196,12 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 			filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastID}}}}
 		}
 
+		// [Firestore compat] noCursorTimeout is rejected by Firestore's MongoDB-compatible endpoint
+		// ("Unsupported fields in find request: [noCursorTimeout]"); omit it. Cursor resumption is
+		// handled explicitly via the _id $gt filter above on cursor loss.
 		findOpts := options.Find().
 			SetBatchSize(int32(readBatchSize)).
-			SetSort(bson.D{{Key: "_id", Value: 1}}).
-			SetNoCursorTimeout(true)
+			SetSort(bson.D{{Key: "_id", Value: 1}})
 
 		cursor, err := sourceCol.Find(ctx, filter, findOpts)
 		if err != nil {
