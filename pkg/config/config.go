@@ -320,9 +320,9 @@ func ApplyDefaults(config *Config) {
 		config.SampleSize = 1000 // Default to 1,000 samples
 	}
 
-	if config.WorkersPerPartition <= 0 {
-		config.WorkersPerPartition = 3 // Default to 3 workers per partition
-	}
+	// WorkersPerPartition intentionally left at 0 when unset: 0 is the "auto"
+	// sentinel resolved by the engine (effectivePartitioning) from the target's
+	// write capacity, rather than a fixed default here.
 
 	if config.IDTypeForPartition == "" {
 		config.IDTypeForPartition = "auto"

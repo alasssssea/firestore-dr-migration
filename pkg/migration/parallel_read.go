@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"firestore-dr-migration/pkg/logger"
@@ -16,6 +17,94 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// maxSubsplitDepth caps how many times a single read partition may be bisected
+// when it keeps hitting Firestore's 128 MiB per-query memory limit. Depth 4 turns
+// one partition into at most 16 sub-ranges, which combined with byte-aware sizing
+// is far more than enough headroom for realistic document-size skew.
+const maxSubsplitDepth = 4
+
+// isQueryMemoryLimitError reports whether err is Firestore's MongoDB-compatible
+// endpoint rejecting a query for exceeding its 128 MiB per-query memory ceiling
+// (a range scan + sort that would buffer too much fails atomically with
+// InvalidArgument: "The query failed since it attempted to use 128.00 MiB when
+// the limit is 128.00 MiB"). Matched on the stable phrasing rather than the exact
+// number so a future limit change still triggers the sub-split fallback.
+func isQueryMemoryLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "MiB when the limit is") ||
+		(strings.Contains(s, "attempted to use") && strings.Contains(s, "MiB"))
+}
+
+// findPartitionSplitID returns a concrete _id value that roughly bisects the set
+// of documents matching filter, so the caller can retry the range in two halves
+// after a 128 MiB failure. It samples _ids WITHIN the filter ($match then
+// $sample — the same shape the partitioner already relies on, and small enough to
+// stay well under the memory limit), sorts them, and returns the median. The
+// returned value is a real _id of the correct BSON type, so it can be ANDed onto
+// any filter shape ($lt/$gte range, $type-scoped, $or-merged) without the caller
+// needing to understand the _id type. Returns ok=false when the range cannot be
+// meaningfully split (fewer than two distinct sampled _ids).
+func findPartitionSplitID(ctx context.Context, coll *mongo.Collection, filter bson.D, sampleSize int, log *logger.Logger) (interface{}, bool) {
+	if sampleSize <= 0 {
+		sampleSize = 1000
+	}
+	if sampleSize > 1000 {
+		sampleSize = 1000
+	}
+
+	sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	cursor, err := coll.Aggregate(sctx, mongo.Pipeline{
+		bson.D{{Key: "$match", Value: filter}},
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+	})
+	if err != nil {
+		if log != nil {
+			log.Warnf("failed to sample _id for sub-split of a partition (%v); cannot bisect", err)
+		}
+		return nil, false
+	}
+	defer cursor.Close(sctx)
+
+	type idDoc struct {
+		ID interface{} `bson:"_id"`
+	}
+	var ids []interface{}
+	for cursor.Next(sctx) {
+		var d idDoc
+		if err := cursor.Decode(&d); err != nil {
+			continue
+		}
+		if d.ID != nil {
+			ids = append(ids, d.ID)
+		}
+	}
+	if len(ids) < 2 {
+		return nil, false
+	}
+
+	// The median makes a balanced split when _ids are uniform; recursion absorbs
+	// any residual skew. Guard against a median equal to the smallest sampled _id
+	// (heavy duplication of the low bound), which would produce an empty lower half
+	// and re-run the identical range forever.
+	mid := ids[len(ids)/2]
+	if reflect.DeepEqual(mid, ids[0]) {
+		for _, id := range ids {
+			if !reflect.DeepEqual(id, ids[0]) {
+				return id, true
+			}
+		}
+		return nil, false
+	}
+	return mid, true
+}
+
 // CollectionPartitioner handles partitioning a collection for parallel reads
 type CollectionPartitioner struct {
 	sourceCollection    *mongo.Collection
@@ -24,6 +113,21 @@ type CollectionPartitioner struct {
 	minDocsPerPartition int
 	sampleSize          int
 	idTypeForPartition  string
+	// forcedPartitionCount, when > 0, overrides the doc-count/knob formula so the
+	// caller can impose a byte-aware partition count (see CountByBytes). The
+	// engine computes this once and reuses it for both the checkpoint arity and
+	// the actual split so the two can never drift.
+	forcedPartitionCount int
+}
+
+// SetForcedPartitionCount pins the number of partitions the partitioner will
+// produce, bypassing the document-count heuristic. Used by the engine to apply a
+// byte-aware count that keeps each partition under Firestore's 128 MiB query
+// limit.
+func (p *CollectionPartitioner) SetForcedPartitionCount(n int) {
+	if n > 0 {
+		p.forcedPartitionCount = n
+	}
 }
 
 // NewCollectionPartitioner creates a new collection partitioner
@@ -48,8 +152,85 @@ func CalculatePartitionCount(totalCount int64, minDocsPerPartition, maxPartition
 }
 
 // CalculatePartitionCount calculates the optimal partition count for the partitioner's configured settings.
+// A forced count (set via SetForcedPartitionCount) takes precedence over the
+// doc-count/knob heuristic, but is still clamped to [1, count].
 func (p *CollectionPartitioner) CalculatePartitionCount(count int64) int {
+	if p.forcedPartitionCount > 0 {
+		n := p.forcedPartitionCount
+		if int64(n) > count {
+			n = int(count)
+		}
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
 	return CalculatePartitionCount(count, p.minDocsPerPartition, p.maxPartitions)
+}
+
+// EstimateAvgDocSize returns the average document size in bytes for the source
+// collection. It first asks the server via collStats (cheap, exact), and falls
+// back to sampling and measuring real BSON sizes when collStats is unavailable
+// or returns nothing — Firestore's MongoDB-compatible endpoint does not
+// implement every admin command, so the sampling path must always work. A 1.3x
+// safety factor is applied to the sampled figure to absorb size skew (the sample
+// can under-represent the largest documents that actually drive the 128 MiB
+// query-memory blowup). Returns a conservative 1024 bytes if everything fails.
+func EstimateAvgDocSize(ctx context.Context, coll *mongo.Collection, sampleSize int, log *logger.Logger) int64 {
+	const fallback int64 = 1024
+
+	// 1) collStats.avgObjSize — authoritative and cheap when supported.
+	statsCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	var stats struct {
+		AvgObjSize float64 `bson:"avgObjSize"`
+	}
+	err := coll.Database().RunCommand(statsCtx, bson.D{{Key: "collStats", Value: coll.Name()}}).Decode(&stats)
+	cancel()
+	if err == nil && stats.AvgObjSize > 0 {
+		return int64(stats.AvgObjSize)
+	}
+	if log != nil {
+		log.Infof("collStats unavailable for %s (%v); estimating average document size by sampling", coll.Name(), err)
+	}
+
+	// 2) Sample real documents and measure their marshalled BSON size.
+	if sampleSize <= 0 {
+		sampleSize = 200
+	}
+	if sampleSize > 1000 {
+		sampleSize = 1000 // cap: sampling is only to size partitions, not to be exact
+	}
+	sampleCtx, cancel2 := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel2()
+	cursor, err := coll.Aggregate(sampleCtx, mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+	})
+	if err != nil {
+		if log != nil {
+			log.Warnf("failed to sample %s for average document size (%v); assuming %d bytes/doc", coll.Name(), err, fallback)
+		}
+		return fallback
+	}
+	defer cursor.Close(sampleCtx)
+
+	var total int64
+	var n int64
+	for cursor.Next(sampleCtx) {
+		total += int64(len(cursor.Current)) // cursor.Current is the raw BSON document
+		n++
+	}
+	if n == 0 || total == 0 {
+		if log != nil {
+			log.Warnf("sampling returned no documents for %s; assuming %d bytes/doc", coll.Name(), fallback)
+		}
+		return fallback
+	}
+	avg := total / n
+	withSkew := avg + avg*3/10 // 1.3x safety factor
+	if withSkew < 1 {
+		withSkew = fallback
+	}
+	return withSkew
 }
 
 // Partition creates partitions for a collection
@@ -964,4 +1145,3 @@ func mergeTypeSlices(slicesPerType map[string][]bson.D, numSplits int) []bson.D 
 	}
 	return result
 }
-

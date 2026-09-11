@@ -19,6 +19,7 @@ import (
 	"firestore-dr-migration/pkg/idmap"
 	"firestore-dr-migration/pkg/logger"
 	"firestore-dr-migration/pkg/metrics"
+	"firestore-dr-migration/pkg/partition"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -581,7 +582,45 @@ func (m *Migrator) effectivePartitioning(dbName, collName string) (parallelEnabl
 		}
 		break // the pair for this source db is found; stop scanning
 	}
+	// Resolve the "auto" sentinel for per-partition write workers. 0 (unset) maps
+	// to a modest default that keeps target write pressure sane; multi-region
+	// BulkWrite latency (~230ms/batch) means a few workers per partition already
+	// saturate a partition's read feed, and total write concurrency is governed by
+	// the partition-concurrency limit (partitionConcurrency) anyway.
+	if workersPerPart <= 0 {
+		workersPerPart = 4
+	}
 	return
+}
+
+// partitionConcurrency decides how many partitions the parallel backfill runs at
+// once. Partition COUNT is a correctness knob (each must fit Firestore's 128 MiB
+// query limit), so a large collection can produce dozens or hundreds of
+// partitions; running them all concurrently would exhaust the connection pools.
+// This decouples the two: create many small partitions, but only process a
+// bounded number simultaneously. The bound is derived from the target pool
+// (each active partition uses ~workersPerPart write connections) and capped so a
+// huge collection cannot spawn unbounded concurrency.
+func partitionConcurrency(targetMaxPool, workersPerPart, numPartitions int) int {
+	const hardCap = 16
+	if workersPerPart < 1 {
+		workersPerPart = 1
+	}
+	if targetMaxPool <= 0 {
+		targetMaxPool = 256
+	}
+	// Reserve one connection per active partition for overhead beyond its writers.
+	c := targetMaxPool / (workersPerPart + 1)
+	if c > hardCap {
+		c = hardCap
+	}
+	if c < 1 {
+		c = 1
+	}
+	if numPartitions > 0 && c > numPartitions {
+		c = numPartitions
+	}
+	return c
 }
 
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
@@ -1141,12 +1180,27 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	// these effective values feed both those partitioners and expectedPartitions
 	// so the checkpoint arity stays consistent with a per-collection override.
 	_, maxParts, workersPerPart, minDocsPerPart, _ := m.effectivePartitioning(sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+	_ = minDocsPerPart // superseded by the byte-aware sizing below; kept for override resolution symmetry
 
-	// Calculate optimal partition count. Use the per-collection effective knobs
-	// (not the global m.config.*) so the checkpoint set arity matches what the
-	// partitioner above actually produces — otherwise a per-collection override
-	// would force every resume onto the full-rescan path.
-	expectedPartitions := CalculatePartitionCount(totalCount, minDocsPerPart, maxParts)
+	// Byte-aware partition sizing. Firestore's MongoDB-compatible endpoint caps a
+	// single query at 128 MiB of memory, so partitions must be sized by BYTES, not
+	// by a static document-count knob: estimate the average document size and split
+	// so each partition's scan stays under the per-partition budget (64 MiB). This
+	// is the single count reused for both the checkpoint arity (expectedPartitions)
+	// and the actual split (SetForcedPartitionCount on the partitioners below), so
+	// the two can never drift.
+	avgDocSize := EstimateAvgDocSize(ctx, sourceCollection, m.config.SampleSize, m.log)
+	byteAwareCount, capOverridden := partition.CountByBytes(totalCount, avgDocSize, partition.DefaultPartitionBudgetBytes, maxParts)
+	if capOverridden {
+		m.log.Warnf("[%s.%s] maxReadPartitions=%d is below the %d partitions needed to keep each partition under Firestore's 128 MiB query limit (%d docs, ~%d bytes/doc); overriding to %d for safety",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, maxParts, byteAwareCount, totalCount, avgDocSize, byteAwareCount)
+	}
+	m.log.Infof("[%s.%s] Byte-aware partitioning: %d docs, ~%d bytes/doc, %d MiB/partition budget => %d partitions",
+		sourceDB.GetDatabaseName(), collConfig.SourceCollection, totalCount, avgDocSize, partition.DefaultPartitionBudgetBytes>>20, byteAwareCount)
+
+	// This byte-aware count is authoritative for both checkpoint arity and the
+	// partitioner split.
+	expectedPartitions := byteAwareCount
 
 	// Evaluate backfill resumption plan for parallel migration
 	plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, expectedPartitions)
@@ -1206,6 +1260,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			m.config.SampleSize,
 			m.config.IDTypeForPartition,
 		)
+		partitioner.SetForcedPartitionCount(byteAwareCount)
 		var partErr error
 		rawPartitions, partErr := partitioner.Partition(ctx)
 		if partErr != nil {
@@ -1254,6 +1309,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			m.config.SampleSize,
 			m.config.IDTypeForPartition,
 		)
+		partitioner.SetForcedPartitionCount(byteAwareCount)
 		var partErr error
 		partitions, partErr = partitioner.Partition(ctx)
 		if partErr != nil {
@@ -1364,12 +1420,23 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		}
 	}()
 
+	// Bound how many partitions run concurrently. Byte-aware sizing can produce
+	// far more partitions than we want live at once; the semaphore caps concurrent
+	// cursors/writers so the connection pools are not overwhelmed, while still
+	// letting every partition run eventually.
+	concurrency := partitionConcurrency(m.config.TargetMaxPoolSize, workersPerPart, len(partitions))
+	m.log.Infof("[%s.%s] Processing %d partitions, up to %d concurrently (%d workers each)",
+		sourceDB.GetDatabaseName(), collConfig.SourceCollection, len(partitions), concurrency, workersPerPart)
+	partitionSem := make(chan struct{}, concurrency)
+
 	// Process each partition
 	for i, partition := range partitions {
 		wg.Add(1)
+		partitionSem <- struct{}{}
 
 		go func(partitionIndex int, filter bson.D, checkpoint *PartitionCheckpoint) {
 			defer wg.Done()
+			defer func() { <-partitionSem }()
 
 			m.log.Debugf("Starting partition %d with filter: %v", partitionIndex, filter)
 
@@ -1377,18 +1444,6 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			tracker := NewBackfillPartitionTracker(m.log, checkpoint, checkpointPath, checkpointInterval, saveThreshold)
 			tracker.Start(ctx)
 			defer tracker.Close()
-
-			// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic traversal order within the partition.
-			// The resumption filter uses $gte on the last checkpointed _id, so correct ordering is required
-			// to ensure no documents are skipped or duplicated upon resume.
-			// [Firestore compat] noCursorTimeout is rejected by Firestore's MongoDB-compatible endpoint; omit it.
-			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(m.config.InitialReadBatchSize)))
-			if err != nil {
-				errorChan <- fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err)
-				return
-			}
-			// [Safety Fix 5: Memory Leak on Server] Ensure partition cursor is closed on exit to prevent server-side resource leakage.
-			defer cursor.Close(ctx)
 
 			// Set up parallel batch processing within this partition
 			var partitionWg sync.WaitGroup
@@ -1454,84 +1509,121 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				close(partitionDoneChan)
 			}()
 
-			// Process documents and create batches
+			// Process documents and create batches. The read is wrapped in a
+			// recursive helper so that if a range scan hits Firestore's 128 MiB
+			// per-query memory limit, we bisect that range by _id and retry each
+			// half instead of failing the whole migration. Byte-aware partition
+			// sizing keeps us under the limit; this is the safety net for
+			// document-size skew that a partition's average size did not predict.
 			var batch []interface{}
 			var batchCount int
 
-			for {
-				// Check for errors from workers
-				select {
-				case err := <-partitionErrorChan:
-					cursor.Close(ctx)
-					close(partitionBatchChan)
-					errorChan <- err
-					return
-				default:
-					// No errors, continue processing
+			var readRange func(rangeFilter bson.D, depth int) error
+			readRange = func(rangeFilter bson.D, depth int) error {
+				// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic
+				// traversal order within the partition. The resumption filter uses $gte on the
+				// last checkpointed _id, so correct ordering is required to avoid skips or
+				// duplicates on resume. [Firestore compat] noCursorTimeout is rejected by
+				// Firestore's MongoDB-compatible endpoint; omit it.
+				cursor, err := sourceCollection.Find(ctx, rangeFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(m.config.InitialReadBatchSize)))
+				if err != nil {
+					return fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err)
 				}
+				// [Safety Fix 5: Memory Leak on Server] Ensure the cursor is closed to prevent
+				// server-side resource leakage, including on the sub-split recursion path.
+				defer cursor.Close(ctx)
 
-				// Get next document
-				readStart := time.Now()
-				hasNext := cursor.Next(ctx)
-				if !hasNext {
-					break
-				}
-
-				// Decode document
-				var doc bson.D
-				if err := cursor.Decode(&doc); err != nil {
-					close(partitionBatchChan)
-					errorChan <- fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, err)
-					return
-				}
-				readDuration := time.Since(readStart)
-
-				if opts.BackfillStatsManager != nil {
-					opts.BackfillStatsManager.RecordRead(bfNS, readDuration, len(cursor.Current))
-				}
-
-				// Add to batch
-				batch = append(batch, doc)
-				batchCount++
-
-				if batchCount >= m.config.InitialWriteBatchSize {
-					seq := tracker.RegisterBatch(batch)
-					item := backfillBatchItem{batch: batch, seq: seq}
-					sendStart := time.Now()
+				var emittedThisRange int64
+				for {
+					// Check for errors from workers
 					select {
-					case partitionBatchChan <- item:
-						if opts.BackfillStatsManager != nil {
-							opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
-						}
-						// Batch sent to worker
 					case err := <-partitionErrorChan:
-						// Error from a worker
-						cursor.Close(ctx)
-						close(partitionBatchChan)
-						errorChan <- err
-						return
-					case <-ctx.Done():
-						// Context cancelled
-						cursor.Close(ctx)
-						close(partitionBatchChan)
-						errorChan <- ctx.Err()
-						return
+						return err
+					default:
+						// No errors, continue processing
 					}
 
-					// Reset batch
-					batch = nil
-					batchCount = 0
+					// Get next document
+					readStart := time.Now()
+					hasNext := cursor.Next(ctx)
+					if !hasNext {
+						break
+					}
+
+					// Decode document
+					var doc bson.D
+					if err := cursor.Decode(&doc); err != nil {
+						return fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, err)
+					}
+					readDuration := time.Since(readStart)
+
+					if opts.BackfillStatsManager != nil {
+						opts.BackfillStatsManager.RecordRead(bfNS, readDuration, len(cursor.Current))
+					}
+
+					// Add to batch
+					batch = append(batch, doc)
+					batchCount++
+					emittedThisRange++
+
+					if batchCount >= m.config.InitialWriteBatchSize {
+						seq := tracker.RegisterBatch(batch)
+						item := backfillBatchItem{batch: batch, seq: seq}
+						sendStart := time.Now()
+						select {
+						case partitionBatchChan <- item:
+							if opts.BackfillStatsManager != nil {
+								opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
+							}
+							// Batch sent to worker
+						case err := <-partitionErrorChan:
+							// Error from a worker
+							return err
+						case <-ctx.Done():
+							// Context cancelled
+							return ctx.Err()
+						}
+
+						// Reset batch
+						batch = nil
+						batchCount = 0
+					}
 				}
+
+				// Check for cursor errors
+				if err := cursor.Err(); err != nil {
+					// [128 MiB fallback] Firestore fails a range-scan+sort atomically when it
+					// would exceed the 128 MiB query-memory ceiling, before streaming any
+					// document. If nothing was emitted from this range yet, we can safely bisect
+					// it by _id and retry each half without duplicating: ranges are read
+					// low-to-high, so a failed range (0 emitted) never overlaps documents already
+					// buffered from earlier, lower ranges.
+					if isQueryMemoryLimitError(err) && depth < maxSubsplitDepth && emittedThisRange == 0 {
+						if splitID, ok := findPartitionSplitID(ctx, sourceCollection, rangeFilter, m.config.SampleSize, m.log); ok {
+							m.log.Warnf("[%s.%s] partition %d hit Firestore's 128 MiB query limit at depth %d; bisecting the _id range and retrying each half",
+								sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, depth)
+							loFilter := bson.D{{Key: "$and", Value: bson.A{rangeFilter, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: splitID}}}}}}}
+							hiFilter := bson.D{{Key: "$and", Value: bson.A{rangeFilter, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: splitID}}}}}}}
+							if lerr := readRange(loFilter, depth+1); lerr != nil {
+								return lerr
+							}
+							return readRange(hiFilter, depth+1)
+						}
+						m.log.Warnf("[%s.%s] partition %d hit the 128 MiB limit but no split point could be found; not subsplitting",
+							sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex)
+					}
+					return fmt.Errorf("cursor error in partition %d: %w", partitionIndex, err)
+				}
+				return nil
 			}
 
-			// Check for cursor errors
-			if err := cursor.Err(); err != nil {
+			if err := readRange(filter, 0); err != nil {
 				close(partitionBatchChan)
-				errorChan <- fmt.Errorf("cursor error in partition %d: %w", partitionIndex, err)
+				errorChan <- err
 				return
 			}
 
-			// Process any remaining documents
+			// Process any remaining documents (flushed once, after every sub-range).
 			if len(batch) > 0 {
 				seq := tracker.RegisterBatch(batch)
 				item := backfillBatchItem{batch: batch, seq: seq}
