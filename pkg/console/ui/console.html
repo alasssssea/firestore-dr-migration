@@ -470,6 +470,11 @@ const I18N = {
     // dynamic — create modal
     willCreateFs: id => `Will create Firestore database <code>${id}</code> <span class="tag">Enterprise · MongoDB compatible (fixed)</span>`,
     locationLabel: `Location (multi-region)`,
+    mrLoc: id => ({
+      nam5: `nam5 — United States, Central (Iowa + Oklahoma)`,
+      nam7: `nam7 — United States, Central & East (Iowa + N. Virginia)`,
+      eur3: `eur3 — Europe (Belgium + Netherlands)`,
+    }[id] || id),
     pitrLabel: `Enable Point-in-time recovery (PITR)`,
     backupLabel: `Scheduled backups`,
     backupNone: `No backups`,
@@ -822,6 +827,11 @@ const I18N = {
     incompatTag: ed => `${ed} · 非 MongoDB 兼容，不可选`,
     willCreateFs: id => `将创建 Firestore 库 <code>${id}</code> <span class="tag">Enterprise · MongoDB 兼容（固定）</span>`,
     locationLabel: `位置（多区域）`,
+    mrLoc: id => ({
+      nam5: `nam5 — 美国中部（爱荷华 + 俄克拉荷马）`,
+      nam7: `nam7 — 美国中部与东部（爱荷华 + 北弗吉尼亚）`,
+      eur3: `eur3 — 欧洲（比利时 + 荷兰）`,
+    }[id] || id),
     pitrLabel: `启用 Point-in-time recovery (PITR)`,
     backupLabel: `计划备份 (Scheduled backups)`,
     backupNone: `不备份`,
@@ -1300,7 +1310,7 @@ async function createTarget(dbn, id){
   const def = "nam5"; // default multi-region target
   const opts = LOCS.length ? LOCS : [def];
   const locHtml = opts.map(l =>
-    `<option value="${esc(l)}"${l===def?" selected":""}>${esc(l)}</option>`).join("");
+    `<option value="${esc(l)}"${l===def?" selected":""}>${esc(t("mrLoc", l))}</option>`).join("");
   el("cmBody").innerHTML =
     `<p class="muted">${t("willCreateFs", esc(id))}</p>` +
     `<label class="fld">${esc(t("locationLabel"))}` +
