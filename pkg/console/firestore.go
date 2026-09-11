@@ -29,13 +29,15 @@ type FirestoreDB struct {
 // the choices that actually vary are surfaced.
 type CreateOptions struct {
 	ID             string `json:"id"`
-	Location       string `json:"location"`       // single-region location id
+	Location       string `json:"location"`       // multi-region location id (nam5/eur3/nam7)
 	EnablePITR     bool   `json:"enablePitr"`     // point-in-time recovery
 	BackupSchedule string `json:"backupSchedule"` // "", "daily", or "weekly"
 }
 
-// multiRegionLocations are the Firestore multi-region locations we exclude from
-// the console's single-region picker (the operator asked for single-region only).
+// multiRegionLocations are the Firestore multi-region locations. This tool
+// migrates a regional source to a MULTI-REGION target, so these are the only
+// locations offered in the console's target-creation picker. (Firestore has a
+// small, stable set of multi-regions; add here if Google introduces more.)
 var multiRegionLocations = map[string]bool{"eur3": true, "nam5": true, "nam7": true}
 
 // firestoreRaw is the subset of `gcloud firestore databases (list|describe)`
@@ -79,8 +81,9 @@ func ListFirestoreDatabases(ctx context.Context) ([]FirestoreDB, error) {
 	return dbs, nil
 }
 
-// ListFirestoreLocations returns the single-region Firestore locations offered
-// as targets (multi-region locations are excluded per the console's scope).
+// ListFirestoreLocations returns the Firestore MULTI-REGION locations offered as
+// migration targets. This tool moves a regional source to a multi-region target,
+// so single-region locations are intentionally excluded from the picker.
 func ListFirestoreLocations(ctx context.Context) ([]string, error) {
 	out, err := runGcloud(ctx, 60*time.Second,
 		"firestore", "locations", "list", "--format=value(locationId)")
@@ -90,7 +93,7 @@ func ListFirestoreLocations(ctx context.Context) ([]string, error) {
 	var locs []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		id := strings.TrimSpace(line)
-		if id == "" || multiRegionLocations[id] {
+		if id == "" || !multiRegionLocations[id] {
 			continue
 		}
 		locs = append(locs, id)
@@ -105,7 +108,7 @@ func ListFirestoreLocations(ctx context.Context) ([]string, error) {
 // set rather than erroring out.
 func CreateFirestoreDatabase(ctx context.Context, opts CreateOptions) (FirestoreDB, error) {
 	if opts.Location == "" {
-		opts.Location = "asia-northeast1"
+		opts.Location = "nam5" // default to a multi-region target
 	}
 	args := []string{
 		"firestore", "databases", "create",

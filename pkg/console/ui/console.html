@@ -469,7 +469,7 @@ const I18N = {
     incompatTag: ed => `${ed} · not MongoDB compatible, unavailable`,
     // dynamic — create modal
     willCreateFs: id => `Will create Firestore database <code>${id}</code> <span class="tag">Enterprise · MongoDB compatible (fixed)</span>`,
-    locationLabel: `Location (single region)`,
+    locationLabel: `Location (multi-region)`,
     pitrLabel: `Enable Point-in-time recovery (PITR)`,
     backupLabel: `Scheduled backups`,
     backupNone: `No backups`,
@@ -821,7 +821,7 @@ const I18N = {
     clickRefreshHint: `（点上方"刷新 Firestore 库列表"）`,
     incompatTag: ed => `${ed} · 非 MongoDB 兼容，不可选`,
     willCreateFs: id => `将创建 Firestore 库 <code>${id}</code> <span class="tag">Enterprise · MongoDB 兼容（固定）</span>`,
-    locationLabel: `位置（单区域）`,
+    locationLabel: `位置（多区域）`,
     pitrLabel: `启用 Point-in-time recovery (PITR)`,
     backupLabel: `计划备份 (Scheduled backups)`,
     backupNone: `不备份`,
@@ -1079,7 +1079,7 @@ function setLang(l){
 let DETECT = null;          // last /api/detect response
 let FIRES = [];             // Firestore databases from /api/firestore/databases
 let FIRES_LOADED = false;
-let LOCS = [];              // single-region Firestore locations from /api/firestore/locations
+let LOCS = [];              // multi-region Firestore locations from /api/firestore/locations
 let LOCS_LOADED = false;
 const MAPPING = {};         // sourceDB -> {endpoint, dbID}
 
@@ -1297,7 +1297,7 @@ async function loadLocations(){
 async function createTarget(dbn, id){
   el("dd-"+cssid(dbn)).classList.add("hidden");
   await loadLocations();
-  const def = "asia-northeast1";
+  const def = "nam5"; // default multi-region target
   const opts = LOCS.length ? LOCS : [def];
   const locHtml = opts.map(l =>
     `<option value="${esc(l)}"${l===def?" selected":""}>${esc(l)}</option>`).join("");
