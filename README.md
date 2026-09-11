@@ -65,6 +65,30 @@ The full copy must finish within the change-stream retention window, or CDC catc
 
 Docs: <https://docs.cloud.google.com/firestore/mongodb-compatibility/docs/change-streams>
 
+## Tuning replication throughput (`incrementalWorkerCount`)
+
+During the live/live-only phase, change events are applied to the target by `incrementalWorkerCount` worker goroutines. These workers are **I/O-bound** — each blocks on a bulk write to the target — so this knob is what determines whether replication keeps up with your source write rate (and therefore your effective RPO).
+
+The numbers below are measured against a **multi-region** Firestore target (bulk-write p50 ~168ms). Rule of thumb: size the apply ceiling to **≥ 1.5× your peak write rate** so lag stays near zero instead of barely keeping up. Ordering/consistency is unaffected by this value — events are routed to a worker by document-ID hash, so all changes to the same document always stay in order.
+
+| Peak document changes/sec | Typical workload | Recommended `incrementalWorkerCount` | Approx. apply ceiling |
+|---|---|---|---|
+| **< 200/s** | Config store, low-frequency backend DB, small app | **8** | ~470/s |
+| **~500/s** | Mid-size SaaS, order/transaction stream | **16** | ~850/s |
+| **~1,000/s** | Production primary DB peak | **32** (default) | ~1,400/s |
+| **~2,000/s** | High write volume, hot single collection | **48** | ~1,800/s |
+| **~3,000/s** | Very high write volume | **64**, plus raise `incrementalWriteBatchSize` (256) and `targetMaxPoolSize` | ~2,200/s |
+| **> 3,000/s** | Very large scale | Add workers, but the **target database** may become the bottleneck — benchmark first | measure |
+
+**Example.** A customer DB peaks at ~800 document changes/sec. Target ceiling should be ≥ 800 × 1.5 = 1,200/s → that falls in the 32-worker tier (~1,400/s), so set `incrementalWorkerCount: 32`. 16 workers (~850/s) is only just above 800 and will accumulate lag on any burst, so it is not a safe choice.
+
+Two caveats:
+
+1. These figures are for a **multi-region** target. A **single-region** target (co-located with the source) has much lower write latency, so the same throughput needs **fewer** workers — treat the table as conservative and roughly halve for single-region.
+2. More workers is not always better: past a point the bottleneck shifts from tool concurrency to the target's write capacity, and adding workers only adds connections without raising throughput. Always benchmark above ~2,000/s.
+
+Quick sizing formula: `workers ≈ peak_write_rate ÷ 45`, rounded up, then add ~1.5× headroom (45 = conservative per-worker effective throughput against a multi-region target).
+
 ## Documentation
 
 - [使用说明.md](使用说明.md) — Chinese usage guide (install, configure, run, cutover).
