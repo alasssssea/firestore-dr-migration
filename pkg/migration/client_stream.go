@@ -701,9 +701,26 @@ func CaptureAndSaveInitialResumeToken(ctx context.Context, sourceDB *db.MongoDB,
 	}
 	defer initialChangeStream.Close(ctx)
 
+	// Unlike self-hosted MongoDB, Firestore does not return a post-batch resume
+	// token (PBRT) on the initial aggregate response — the token is only
+	// populated after at least one getMore round-trip. Reading ResumeToken()
+	// straight after Watch() therefore yields an empty token. Drive TryNext()
+	// until the token is available: TryNext refreshes the PBRT on every
+	// round-trip even when it returns no event, and if it does surface an event
+	// that is harmless here — the event predates the initial copy snapshot that
+	// runs next, so it is captured by the full copy while CDC resumes from this
+	// token (idempotent overlap, no data loss).
 	initialResumeToken := initialChangeStream.ResumeToken()
-	if len(initialResumeToken) == 0 {
-		return nil, fmt.Errorf("captured empty resume token from change stream")
+	deadline := time.Now().Add(30 * time.Second)
+	for len(initialResumeToken) == 0 {
+		initialChangeStream.TryNext(ctx)
+		if err := initialChangeStream.Err(); err != nil {
+			return nil, fmt.Errorf("change stream error while capturing initial resume token: %w", err)
+		}
+		initialResumeToken = initialChangeStream.ResumeToken()
+		if len(initialResumeToken) == 0 && time.Now().After(deadline) {
+			return nil, fmt.Errorf("captured empty resume token from change stream after 30s (source change stream may be enabled but returned no post-batch resume token)")
+		}
 	}
 	log.Infof("Obtained initial resume token: %v", initialResumeToken)
 
