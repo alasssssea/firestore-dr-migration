@@ -4,7 +4,7 @@
 
 A Firestore database's location is **immutable after creation**, so "move to multi-region" really means: **create a new multi-region database → copy the data → catch up on live changes (CDC) → cut over.**
 
-This is a fork of [gsbingo17/mongodb-to-new](https://github.com/gsbingo17). It is **Firestore → Firestore only** — all MongoDB self-hosted source, oplog, and legacy-driver (`mgo`/`gtm`) code paths have been removed.
+It is **Firestore → Firestore only** — all MongoDB self-hosted source, oplog, and legacy-driver (`mgo`/`gtm`) code paths have been removed.
 
 ## Features
 
