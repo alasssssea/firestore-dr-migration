@@ -37,8 +37,8 @@ type MongoDB struct {
 	// counts every async build launched this run; indexDone counts those finished
 	// (success OR failure). indexBuilding names the index currently being sent to
 	// the server ("coll[name]"), "" when idle. All read via IndexProgress().
-	indexTotal    int64 // atomic
-	indexDone     int64 // atomic
+	indexTotal    int64        // atomic
+	indexDone     int64        // atomic
 	indexBuilding atomic.Value // string; the index currently being built
 }
 
@@ -60,19 +60,47 @@ func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize 
 		clientOptions.SetPoolMonitor(poolMonitor)
 	}
 
-	// Connect to MongoDB
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client, err := mongo.Connect(ctx, clientOptions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
+	// Connect + ping with bounded retry. Firestore's MongoDB-compat endpoint
+	// occasionally drops the initial TLS/handshake ("socket was unexpectedly
+	// closed: EOF") — a transient, retryable condition rather than a
+	// misconfiguration. A single Ping would surface that blip as a hard startup
+	// failure, so retry a few times with exponential backoff before giving up.
+	// Non-transient errors (auth, bad host, missing db) fail fast so the operator
+	// is not left waiting on a hopeless loop, and either way the final error
+	// carries actionable guidance.
+	const maxAttempts = 5
+	var client *mongo.Client
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		client, lastErr = mongo.Connect(ctx, clientOptions)
+		if lastErr == nil {
+			// mongo.Connect is lazy; Ping forces the actual handshake where the
+			// transient EOF shows up.
+			lastErr = client.Ping(ctx, nil)
+		}
+		cancel()
+		if lastErr == nil {
+			break // connected and verified
+		}
+		// Tear down the half-open client before retrying or returning.
+		if client != nil {
+			dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = client.Disconnect(dctx)
+			dcancel()
+			client = nil
+		}
+		if !isTransientConnectError(lastErr) || attempt == maxAttempts {
+			break
+		}
+		delay := connectBackoff(attempt)
+		if log != nil {
+			log.Warnf("连接数据库失败（第 %d/%d 次，可重试的瞬时错误）：%v；%v 后重试", attempt, maxAttempts, lastErr, delay)
+		}
+		time.Sleep(delay)
 	}
-
-	// Ping the database to verify connection
-	err = client.Ping(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
+	if lastErr != nil {
+		return nil, connectError(lastErr)
 	}
 
 	// Get database
@@ -84,6 +112,65 @@ func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize 
 		log:            log,
 		indexSemaphore: make(chan struct{}, 1), // serialize async index builds to prevent Firestore cross-transaction contention
 	}, nil
+}
+
+// isTransientConnectError reports whether a connect/ping failure is the kind
+// that typically clears on its own (network blips, Firestore's handshake EOF,
+// server-selection timeouts) and is therefore worth retrying. Auth failures and
+// malformed hosts are intentionally excluded — retrying those only wastes time.
+func isTransientConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, sub := range []string{
+		"socket was unexpectedly closed",
+		"EOF",
+		"connection reset by peer",
+		"broken pipe",
+		"i/o timeout",
+		"deadline exceeded",
+		"Deadline exceeded",
+		"DeadlineExceeded",
+		"server selection error",
+		"connection refused",
+		"no reachable servers",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// connectBackoff returns the wait before the next connect attempt: 2s, 4s, 8s,
+// 16s, capped at 30s (attempt is 1-based).
+func connectBackoff(attempt int) time.Duration {
+	d := time.Duration(int64(1)<<uint(attempt)) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
+// connectError wraps a final (post-retry) connection failure with guidance the
+// operator can act on, split by whether the failure looked transient or like a
+// configuration problem. The raw connection string is deliberately not echoed —
+// it can carry a password.
+func connectError(err error) error {
+	if isTransientConnectError(err) {
+		return fmt.Errorf("连接数据库失败（已重试 5 次仍未成功，属瞬时网络/握手错误如 EOF）：%w\n"+
+			"  排查建议：\n"+
+			"    1) 确认该 Firestore 库存在且状态 READY：gcloud firestore databases describe --database=<id>\n"+
+			"    2) 确认连接串 Endpoint 主机名 uid.<location>.firestore.goog 与该库当前 uid/location 一致（删库重建后 uid 会变，Endpoint 必须同步更新）\n"+
+			"    3) 确认本机到 *.firestore.goog:443 网络可达（VPC / 防火墙 / 出口代理）\n"+
+			"    4) Firestore 偶发握手 EOF 通常会自行恢复，可稍后整体重跑", err)
+	}
+	return fmt.Errorf("连接数据库失败（非瞬时错误，通常是认证或连接串配置问题）：%w\n"+
+		"  排查建议：\n"+
+		"    1) 检查用户名/密码或 OIDC 服务账号是否正确、是否已过期\n"+
+		"    2) 连接串是否带 retryWrites=false（Firestore 必需）\n"+
+		"    3) 目标库是否为 ENTERPRISE 版且已开启 MongoDB 兼容数据访问", err)
 }
 
 // SetIndexConcurrency replaces the index build semaphore with one of the given capacity.
@@ -484,11 +571,11 @@ func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo
 	startTime := time.Now()
 	_, err := collection.Indexes().CreateOne(ctx, indexModel)
 	if err != nil {
-		m.log.Infof("[async] Received ERROR response for index '%s' on collection '%s' after %v: %v", 
+		m.log.Infof("[async] Received ERROR response for index '%s' on collection '%s' after %v: %v",
 			indexName, collectionName, time.Since(startTime).Round(time.Second), err)
 		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
 	}
-	m.log.Infof("[async] Received SUCCESS response for index '%s' on collection '%s' after %v", 
+	m.log.Infof("[async] Received SUCCESS response for index '%s' on collection '%s' after %v",
 		indexName, collectionName, time.Since(startTime).Round(time.Second))
 	return nil
 }
