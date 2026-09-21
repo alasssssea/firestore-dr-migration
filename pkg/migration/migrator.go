@@ -284,6 +284,14 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		}
 	}
 
+	// When attached to the console in a live mode, start the slow source↔target
+	// count-reconciliation poller so each collection row shows the ground-truth
+	// "behind by N docs" gap (not just the event-time lag). Uses the same context
+	// as the other pollers so it stops when the pair ends.
+	if m.controlPlaneAttached() && (mode == "live" || mode == "live-only") {
+		m.pollCounts(backfillStatsCtx, pair.Source.Database, sourceDB, targetDB, collections)
+	}
+
 	// Index timing (migrate / full-only mode): indexes are built AFTER the data
 	// load completes (see below, after wg.Wait), never before — building them up
 	// front makes Firestore re-index on every inserted document and stalls the whole

@@ -110,6 +110,43 @@ func TestBuildPartitionFilters_NumericIDs(t *testing.T) {
 	}
 }
 
+// buildKeysetTailFilter drives the true-max keyset walk that caps the final
+// backfill partition. A regression here silently drops data: the previous design
+// capped at a $sample-derived max, losing pre-resume-token docs above it (not in
+// backfill, not redelivered by the change stream, never in the DLQ).
+func TestBuildKeysetTailFilter(t *testing.T) {
+	lower := bson.D{{Key: "$gte", Value: 100}}
+
+	// First page (no cursor yet): only the lower bound, no $gt.
+	f0 := buildKeysetTailFilter(lower, nil)
+	if _, err := getBSONValue(f0, "_id", "$gte"); err != nil {
+		t.Fatalf("first page must keep the lower bound: %v", err)
+	}
+	if _, err := getBSONValue(f0, "_id", "$gt"); err == nil {
+		t.Fatalf("first page must not add a $gt cursor")
+	}
+
+	// Subsequent page: lower bound preserved AND a STRICT $gt on the last _id seen.
+	// $gt (not $gte) is required so the boundary doc is not re-read forever.
+	f1 := buildKeysetTailFilter(lower, 500)
+	lo, err := getBSONValue(f1, "_id", "$gte")
+	if err != nil || lo != 100 {
+		t.Fatalf("paged filter must preserve lower bound $gte:100, got %v (err=%v)", lo, err)
+	}
+	gt, err := getBSONValue(f1, "_id", "$gt")
+	if err != nil || gt != 500 {
+		t.Fatalf("paged filter must advance strictly past cursor with $gt:500, got %v (err=%v)", gt, err)
+	}
+	if _, err := getBSONValue(f1, "_id", "$gte cursor"); err == nil {
+		t.Fatalf("cursor must use $gt, never $gte")
+	}
+
+	// The caller's lower-ops slice must never be mutated across pages.
+	if len(lower) != 1 || lower[0].Key != "$gte" || lower[0].Value != 100 {
+		t.Fatalf("lower ops slice was mutated: %+v", lower)
+	}
+}
+
 // Helper helper to extract value from BSON filter
 func getBSONValue(filter bson.D, key, op string) (interface{}, error) {
 	for _, elem := range filter {

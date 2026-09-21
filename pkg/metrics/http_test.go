@@ -131,7 +131,7 @@ func TestUIServed(t *testing.T) {
 	h := Handler(testRegistry(), nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "迁移控制台") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "迁移进度") {
 		t.Errorf("UI not served, code=%d", rec.Code)
 	}
 }

@@ -316,48 +316,139 @@ func (p *CollectionPartitioner) capFinalPartitionUpperBound(ctx context.Context,
 			return partitions, nil // not a plain range; leave to legacy path
 		}
 	}
-	// NOTE: do NOT use FindOne(sort:{_id:-1}) here. On the Firestore MongoDB-compat
-	// endpoint a full-collection sort buffers the whole result and blows the 128 MiB
-	// per-query limit on large collections. Instead take the max _id over a bounded
-	// $sample. The sampled max sits slightly below the true max, which only means a
-	// thin sliver of the newest pre-backfill docs falls outside the backfill ceiling;
-	// those are captured by the change stream (its resume token predates backfill), so
-	// a sampled ceiling is safe and still guarantees termination under live writes.
-	sampleSize := p.sampleSize
-	if sampleSize <= 0 {
-		sampleSize = 1000
-	}
-	cur, err := p.sourceCollection.Aggregate(ctx, mongo.Pipeline{
-		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: nil},
-			{Key: "max", Value: bson.D{{Key: "$max", Value: "$_id"}}},
-		}}},
-	})
+	// We need the TRUE current max _id to cap the final partition. It must be the
+	// real max, NOT a $sample-derived approximation: the sampled max sits below the
+	// true max, and any document whose _id lands in (sampledMax, trueMax] but which
+	// already existed when the change-stream resume token was captured is then lost
+	// forever — it is excluded from backfill by the $lte ceiling AND never redelivered
+	// by the change stream (its insert predates the resume token). That is the root
+	// cause of the "some collections stay a few hundred/thousand docs behind, nothing
+	// in the DLQ, and the gap never drains after writes stop" symptom, and the deficit
+	// scales as docCount/sampleSize (≈ hundreds–thousands on large collections).
+	//
+	// We also cannot use FindOne(sort:{_id:-1}): a blocking sort buffers the whole
+	// result and blows Firestore's 128 MiB per-query limit on large collections.
+	//
+	// Instead we seed cheaply from a bounded $sample max, then walk the (small) tail
+	// above it with ascending keyset pages. Each page is a tiny _id-only projection
+	// far under 128 MiB, the tail is only ~docCount/sampleSize docs, and because per-
+	// page read throughput vastly exceeds the incoming write rate the walk converges
+	// to the current true max within a handful of pages and always terminates.
+	maxID, err := p.findTrueMaxID(ctx, inner)
 	if err != nil {
-		return nil, fmt.Errorf("failed to sample max _id to bound final backfill partition: %w", err)
-	}
-	defer cur.Close(ctx)
-	var maxID interface{}
-	if cur.Next(ctx) {
-		var res bson.M
-		if derr := cur.Decode(&res); derr != nil {
-			return nil, fmt.Errorf("failed to decode sampled max _id: %w", derr)
-		}
-		maxID = res["max"]
-	}
-	if err := cur.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error sampling max _id: %w", err)
+		return nil, err
 	}
 	if maxID == nil {
+		// Empty range (no documents at or above the lower bound): nothing to cap.
 		return partitions, nil
 	}
 	bounded := make(bson.D, len(inner), len(inner)+1)
 	copy(bounded, inner)
 	bounded = append(bounded, bson.E{Key: "$lte", Value: maxID})
 	partitions[len(partitions)-1] = bson.D{{Key: "_id", Value: bounded}}
-	p.log.Infof("Bounded final backfill partition at snapshot max _id (%v) to guarantee termination under live writes", maxID)
+	p.log.Infof("Bounded final backfill partition at true snapshot max _id (%v) to guarantee termination under live writes without dropping pre-token documents", maxID)
 	return partitions, nil
+}
+
+// buildKeysetTailFilter builds the {_id: {...}} filter for one ascending keyset
+// page: it preserves the partition's lower-bound ops and, when a cursor is known,
+// adds a STRICT `$gt` on the last _id already seen. Strictness is load-bearing —
+// `$gte` would re-read the boundary document every page (non-termination), while
+// omitting the bound would rescan from the start. The lower ops are copied so the
+// caller's slice is never mutated across pages.
+func buildKeysetTailFilter(lowerOps bson.D, cursorID interface{}) bson.D {
+	idOps := make(bson.D, len(lowerOps), len(lowerOps)+1)
+	copy(idOps, lowerOps)
+	if cursorID != nil {
+		idOps = append(idOps, bson.E{Key: "$gt", Value: cursorID})
+	}
+	return bson.D{{Key: "_id", Value: idOps}}
+}
+
+// findTrueMaxID returns the exact maximum _id among documents matching the given
+// lower-bound range ops (e.g. {$gte: X}), or nil if the range is empty.
+//
+// It avoids a blocking sort (which blows Firestore's 128 MiB per-query limit) by
+// seeding from a cheap bounded $sample max and then paging forward over the small
+// tail above that seed with ascending keyset reads. Correctness does not depend on
+// the sample: even if $sample returns nothing, the keyset walk starts from the
+// lower bound and still finds the true max. Each page reads only _id (tiny), so no
+// single query approaches the memory ceiling.
+func (p *CollectionPartitioner) findTrueMaxID(ctx context.Context, lowerOps bson.D) (interface{}, error) {
+	sampleSize := p.sampleSize
+	if sampleSize <= 0 {
+		sampleSize = 1000
+	}
+
+	// Seed: cheap sampled max to skip past the bulk of the collection. Best-effort —
+	// on error or empty result we simply start the keyset walk from the lower bound.
+	var cursorID interface{}
+	if cur, err := p.sourceCollection.Aggregate(ctx, mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "max", Value: bson.D{{Key: "$max", Value: "$_id"}}},
+		}}},
+	}); err == nil {
+		if cur.Next(ctx) {
+			var res bson.M
+			if derr := cur.Decode(&res); derr == nil {
+				cursorID = res["max"]
+			}
+		}
+		cur.Close(ctx)
+	}
+
+	// Keyset walk: read the tail in ascending _id order, page by page, tracking the
+	// last _id seen. A page is filtered by the partition's lower ops AND _id > cursor
+	// (when a cursor/seed is known). Stop when a page returns fewer than pageSize
+	// documents — we have reached the current true max.
+	const pageSize = 10000
+	// Guard against pathological non-termination (e.g. write rate somehow exceeding
+	// read throughput). Bounds the walk to pageSize*maxPages documents above the seed.
+	const maxPages = 100000
+
+	maxID := cursorID
+	findOpts := options.Find().
+		SetSort(bson.D{{Key: "_id", Value: 1}}).
+		SetLimit(pageSize).
+		SetProjection(bson.D{{Key: "_id", Value: 1}})
+
+	for page := 0; page < maxPages; page++ {
+		filter := buildKeysetTailFilter(lowerOps, cursorID)
+
+		cur, err := p.sourceCollection.Find(ctx, filter, findOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to keyset-scan tail for true max _id: %w", err)
+		}
+
+		var n int
+		for cur.Next(ctx) {
+			var doc bson.D
+			if derr := cur.Decode(&doc); derr != nil {
+				cur.Close(ctx)
+				return nil, fmt.Errorf("failed to decode _id during true-max keyset scan: %w", derr)
+			}
+			if id := extractDocID(doc); id != nil {
+				maxID = id
+				cursorID = id
+			}
+			n++
+		}
+		if cerr := cur.Err(); cerr != nil {
+			cur.Close(ctx)
+			return nil, fmt.Errorf("cursor error during true-max keyset scan: %w", cerr)
+		}
+		cur.Close(ctx)
+
+		if n < pageSize {
+			// Reached the end of the tail: cursorID is the current true max.
+			return maxID, nil
+		}
+	}
+
+	p.log.Warnf("true-max keyset scan hit page cap (%d pages of %d); using highest _id seen (%v) as final partition ceiling", maxPages, pageSize, maxID)
+	return maxID, nil
 }
 
 // createObjectIDPartitionsWithSampling creates partitions based on ObjectID sampling

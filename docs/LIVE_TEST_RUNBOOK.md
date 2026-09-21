@@ -132,6 +132,9 @@ gcloud firestore databases delete --database=target-db2 --project=$P --quiet
 - **loadgen burst-drain**:限速器是 `time.Ticker`(`bps=rate/batch`),只在每次迭代顶部放行;放行后那段逐条 `UpdateOne`/`DeleteOne` 不受限速。worker 一多 → 所有 worker 同步插一批后齐刷刷进 update 排水,insert 冻结(ins/s=0),平均总吞吐被拖到 ~500/s。**要真正稳定驱动 1500/s 混合,得改 loadgen:把 update/delete 拆成各自独立限速的 goroutine 池,与 insert 解耦。** 当前未改。
 - **DLQ `context deadline exceeded`**:稳态写超时是 90s([parallel.go:955](../pkg/migration/parallel.go#L955)),只有 shutdown 路径用 10s([parallel.go:951](../pkg/migration/parallel.go#L951))。上一轮那 1400+ 条死信,大部分是 **kill fsdr 时** in-flight 批被 10s 上下文掐的,不是稳态失败。稳态 DLQ ≈ 0。
 - **resumeToken 文件 mtime 不刷新 ≠ 落后**:checkpoint 每 `checkpointIntervalMinutes`(5min)才落盘;判断是否追平看 stats 的 `Read == WorkerReceived`。
+- **【已修】末分区"抽样 max"封顶导致静默丢数**:多分区(objectid/numeric 策略)时,全量末分区曾用 `$sample`(默认 1000 条)的 max 当上界 `$lte`。凡 `_id ∈ (sampledMax, trueMax]` 且**在 resume token 捕获前就已存在**的文档:既不在全量(被 `$lte` 挡掉)、又不在 change stream(insert 早于 token),**永久丢失且不进 DLQ**。缺口 ≈ 表文档数 / sampleSize(百万级表≈1000 条),只发生在大到 >1 分区的表 → 症状=“某些 collection 恒定差几百~上千、CDC 追不上、停写后也不排空、DLQ 为空”。
+  - 为何早期 live 测试没暴露:边写边迁时 `$sample` 常抽中 token 之后的高 `_id` 活文档,把天花板顶高侥幸无损;低写入量/静态表才稳定触发。
+  - 修复([parallel_read.go](../pkg/migration/parallel_read.go) `capFinalPartitionUpperBound`/`findTrueMaxID`):改用**真 max** 封顶。仍不用 `FindOne(sort:{_id:-1})`(会撑爆 128MiB),而是从抽样 max 出发、用有界升序 keyset 尾扫(每页只投影 `_id`、`$gt` 严格推进)拿到真 max。尾部只有 ~docCount/sampleSize 条,读速远大于写速,几页即收敛并终止。回归测试 `TestBuildKeysetTailFilter`。
 
 ---
 

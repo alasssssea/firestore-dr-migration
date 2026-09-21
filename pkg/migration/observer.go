@@ -5,8 +5,12 @@ import (
 	"strings"
 	"time"
 
+	"firestore-dr-migration/pkg/config"
+	"firestore-dr-migration/pkg/db"
 	"firestore-dr-migration/pkg/metrics"
 	"firestore-dr-migration/pkg/progress"
+
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 // This file wires the migrator to the web console's metrics registry and
@@ -286,6 +290,59 @@ func (m *Migrator) pollIncremental(ctx context.Context, dbFallback, _ string, sm
 				}
 				prevT = now
 			}
+		}
+	}()
+}
+
+// pollCounts runs a slow reconciliation loop during the live phase: for each
+// collection it counts documents on BOTH the source and the target and publishes
+// source/target/diff into the console. This is the ground-truth "behind by N
+// docs" gap the operator asked for — and, unlike the change-stream event-time
+// lag (which can read ~0 while documents are silently missing), it is the only
+// signal that surfaces a backfill that dropped pre-token documents.
+//
+// It is deliberately slow (countInterval between full cycles) and counts
+// sequentially so it adds negligible load next to the live write/replicate path.
+// CountDocuments is used rather than EstimatedDocumentCount because Firestore's
+// MongoDB-compat endpoint reports collStats as unavailable. Cheap no-op when no
+// console is attached. Runs in its own goroutine; the caller need not wait.
+func (m *Migrator) pollCounts(ctx context.Context, dbName string, source, target *db.MongoDB, collections []config.CollectionConfig) {
+	if m.reg == nil || source == nil || target == nil || len(collections) == 0 {
+		return
+	}
+	const countInterval = 15 * time.Second
+	const perCountTimeout = 30 * time.Second
+	countOne := func(mdb *db.MongoDB, coll string) (int64, bool) {
+		cctx, cancel := context.WithTimeout(ctx, perCountTimeout)
+		defer cancel()
+		n, err := mdb.GetCollection(coll).CountDocuments(cctx, bson.D{})
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	go func() {
+		// Small initial delay so the first counts run once backfill is underway,
+		// not during the connection storm at startup.
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+			for _, c := range collections {
+				if ctx.Err() != nil {
+					return
+				}
+				src, okS := countOne(source, c.SourceCollection)
+				tgt, okT := countOne(target, c.TargetCollection)
+				if okS && okT {
+					m.reg.SetCollectionCounts(m.jobID, dbName, c.SourceCollection, src, tgt)
+				}
+			}
+			timer.Reset(countInterval)
 		}
 	}()
 }

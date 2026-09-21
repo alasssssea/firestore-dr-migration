@@ -275,6 +275,7 @@
     <h2 data-i18n="progressTitle">实时进度</h2>
     <div class="muted" id="status" data-i18n="statusConnecting">连接中…</div>
     <div id="dlqBanner" class="dlq-banner hidden"></div>
+    <div id="dlqPanel" class="dlq-panel hidden"></div>
     <div id="cutoverCard" class="cutover-card neutral"><div class="cut-light">⚪</div><div class="cut-body"><b data-i18n="cutoverInitial">切换就绪：尚无增量数据</b></div></div>
     <div class="reset-bar">
       <button class="secondary danger" id="resetBtn" onclick="resetSession()" data-i18n="resetBtn">🧹 重置会话</button>
@@ -313,7 +314,6 @@
       <tbody id="rows"></tbody>
     </table>
     <div class="pager" id="pager"></div>
-    <div id="dlqPanel" class="dlq-panel hidden"></div>
 
     <div style="margin-top:1rem;border-top:1px solid #232838;padding-top:.8rem">
       <b data-i18n="verifyTitle">迁移后校验</b> <span class="muted" data-i18n="verifyDesc">对每个源→目标集合比对文档计数（可选内容哈希）。全量完成后再点。</span>
@@ -684,6 +684,11 @@ const I18N = {
     docs: `docs`,
     eventsStopped: n => `${n} events · stopped`,
     eventsTailing: n => `${n} events · tailing`,
+    countPair: (tgt, src) => `target ${tgt} / source ${src}`,
+    countBehind: n => `behind ${n} docs`,
+    countAhead: n => `ahead ${n} (draining)`,
+    countEven: `in sync`,
+    countReconciling: `reconciling counts…`,
     writtenCounting: n => `${n} written (counting…)`,
     rdyGreen: `Ready`,
     rdyAmber: `Catching up`,
@@ -1028,6 +1033,11 @@ const I18N = {
     docs: `文档`,
     eventsStopped: n => `${n} 事件 · 已停`,
     eventsTailing: n => `${n} 事件 · 追尾中`,
+    countPair: (tgt, src) => `目标 ${tgt} / 源 ${src}`,
+    countBehind: n => `差 ${n} 条`,
+    countAhead: n => `超前 ${n} 条(排空中)`,
+    countEven: `已对齐`,
+    countReconciling: `对账中…`,
     writtenCounting: n => `${n} 已写（统计中…）`,
     rdyGreen: `就绪`,
     rdyAmber: `追赶`,
@@ -2112,6 +2122,18 @@ function collRowHTML(c){
     barCell = liveFrozen
       ? `<span class="muted">${esc(t("eventsStopped", (s.doneDocs||0).toLocaleString()))}</span>`
       : `<span class="stream-dot"></span><span class="muted">${esc(t("eventsTailing", (s.doneDocs||0).toLocaleString()))}</span>`;
+    // Ground-truth source↔target document gap (not the event-time lag). This is
+    // what answers "behind by how many docs" and catches a silent-loss regression.
+    if(c.countsKnown){
+      const diff = c.countDiff||0;
+      const cnts = esc(t("countPair", (c.targetCount||0).toLocaleString(), (c.sourceCount||0).toLocaleString()));
+      const gap = diff>0 ? `<span class="bad">${esc(t("countBehind", diff.toLocaleString()))}</span>`
+                : diff<0 ? `<span class="muted">${esc(t("countAhead", (-diff).toLocaleString()))}</span>`
+                : `<span class="ok">${esc(t("countEven"))}</span>`;
+      barCell += `<br><span class="muted" style="font-size:.75rem">${cnts} · ${gap}</span>`;
+    } else {
+      barCell += `<br><span class="muted" style="font-size:.75rem">${esc(t("countReconciling"))}</span>`;
+    }
     pctCell = `<span class="muted">—</span>`;
   } else {
     const known = (s.totalDocs||0) > 0;

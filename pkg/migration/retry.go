@@ -71,7 +71,16 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 
 	errStr := err.Error()
 
-	// Check for connection errors
+	// Check for connection / transient-unavailable errors. This bucket gets the
+	// longest backoff (regular exponential + an extra 5s per attempt), so brief
+	// server-side unavailability windows are ridden out inline instead of burning
+	// through the short default budget and dumping the doc into the DLQ.
+	//
+	// Firestore's MongoDB-compat endpoint returns "ShutdownInProgress" ("The
+	// service is temporarily unavailable. Please retry with exponential backoff.")
+	// during backend instance reschedules — an explicitly retryable, transient
+	// condition, NOT a permanent failure. Treat it (and the generic "Unavailable"
+	// server code) as a connection-class transient so it retries with a real budget.
 	if strings.Contains(errStr, "socket was unexpectedly closed") ||
 		strings.Contains(errStr, "EOF") ||
 		strings.Contains(errStr, "connection reset by peer") ||
@@ -79,7 +88,12 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 		strings.Contains(errStr, "i/o timeout") ||
 		strings.Contains(errStr, "DeadlineExceeded") ||
 		strings.Contains(errStr, "Deadline exceeded") ||
-		strings.Contains(errStr, "deadline exceeded") {
+		strings.Contains(errStr, "deadline exceeded") ||
+		strings.Contains(errStr, "ShutdownInProgress") ||
+		strings.Contains(errStr, "service is temporarily unavailable") ||
+		strings.Contains(errStr, "Please retry with exponential backoff") ||
+		strings.Contains(errStr, "(Unavailable)") ||
+		strings.Contains(errStr, "Service Unavailable") {
 		return ErrorTypeConnection
 	}
 

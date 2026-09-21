@@ -11,7 +11,7 @@ It is **Firestore → Firestore only**
 - **Full copy (`migrate`)** — copies all collections' data and indexes from source to target, then exits.
 - **Full + live tail (`live`)** — records the change-stream resume token first, does the full copy, then automatically switches to CDC (change streams) to keep the target caught up until cutover.
 - **Post-migration verification (`verify`)** — compares source vs target document counts, with optional content-hash comparison.
-- **Browser console (`console`)** — configure, assess, launch, and monitor a migration from a web UI (English / Chinese).
+- **Browser console (`console`)** — configure, assess, launch, and monitor a migration from a web UI (English / Chinese). The live progress view shows, per collection, the **source ↔ target real-time document-count difference** (`目标 N / 源 M · 差 K 条`) as a ground-truth backlog signal, plus an inline **dead-letter-queue (DLQ) inspector** to drill into any failed records without leaving the page.
 - **Control plane** — `/metrics`, health checks, status API, live progress/lag dashboard, and a cutover-readiness signal.
 
 > ⚠️ **Billing**: the source database, the target database, and change streams all incur Firestore charges. Tear down demo/test resources when done.
@@ -24,6 +24,12 @@ It is **Firestore → Firestore only**
 - **The tool never creates databases.** You pre-create the empty multi-region target and provide its connection string.
 - **The tool never freezes source writes.** It signals cutover-readiness; you freeze writes at the application layer, then it drains remaining events.
 - **Change streams are a preflight, not auto-enabled.** For `live`/`live-only`, a change stream must be created manually on the source (see below); the tool detects failure and prints the enablement steps.
+
+## Reliability & correctness
+
+- **No silently dropped documents under live writes.** The final backfill partition is capped at the collection's **true** current max `_id`, discovered by walking an ascending keyset tail (seeded from a bounded `$sample`) rather than from the sampled max itself. The old sampled-max ceiling could leave documents whose `_id` fell in `(sampledMax, trueMax]` — and which predated the change-stream resume token — excluded from backfill *and* never redelivered by CDC, producing a small permanent gap (≈ `docCount / sampleSize` docs) with nothing in the DLQ. Each tail page is a tiny `_id`-only projection well under Firestore's 128 MiB per-query limit, and the walk always terminates.
+- **Transient backend errors are retried, not dead-lettered.** Firestore's retryable backend signals — `ShutdownInProgress` (instance reschedule), "service is temporarily unavailable", "Please retry with exponential backoff", and `Unavailable` — are classified as connection/transient errors and given the full connection-tier retry budget (exponential backoff over ~25–30 s) instead of the short generic budget that would exhaust in a few seconds and push the record to the DLQ prematurely.
+- **DLQ safety net.** Any record that still fails after retries is written to the dead-letter queue rather than dropped, and is visible (and reprocessable) from the console's DLQ inspector — so a transient blip is at most a *recoverable* deferral, never data loss.
 
 ## Quick start
 

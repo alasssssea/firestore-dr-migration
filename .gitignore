@@ -50,3 +50,13 @@ firestore_dr_live_tuned.json
 firestore_dr_us-db.json
 firestore_dr_us-db2.json
 _archive/
+
+# test-only multi-collection seeder
+/cmd/seedmulti/
+seedmulti
+cmd/countcheck/
+cmd/multiwriter/
+multiwriter
+cmd/dbreset/
+cmd/listcolls/
+cmd/countdb/

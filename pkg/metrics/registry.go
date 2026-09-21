@@ -31,8 +31,29 @@ type CollectionMetric struct {
 	Failed int64 `json:"failed,omitempty"`
 	// Error carries a human-readable reason when Phase is "error" (e.g. a pair
 	// that could not start replication). Empty otherwise.
-	Error     string    `json:"error,omitempty"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Error string `json:"error,omitempty"`
+	// Source/Target document counts and their difference, filled during the live
+	// phase by a slow count-reconciliation poller (see observer.pollCounts). Unlike
+	// LagSeconds (a change-stream event-time lag that reads ~0 even when documents
+	// are silently missing), CountDiff is the ground-truth "behind by N docs" gap —
+	// the only signal that catches a backfill that dropped pre-token documents.
+	// CountsKnown is false until the first reconciliation lands (UI shows "对账中…").
+	SourceCount int64 `json:"sourceCount"`
+	TargetCount int64 `json:"targetCount"`
+	CountDiff   int64 `json:"countDiff"` // SourceCount - TargetCount (may be <0 if target briefly ahead)
+	CountsKnown bool  `json:"countsKnown"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+// collCounts holds the latest source/target document counts for one collection,
+// stored separately from CollectionMetric so the fast 2s live poller (which
+// replaces the whole metric each tick) never clobbers the slow count poller's
+// values; they are merged in on read.
+type collCounts struct {
+	source int64
+	target int64
+	known  bool
+	at     time.Time
 }
 
 // JobState is a point in the job lifecycle state machine (DESIGN §5).
@@ -75,6 +96,7 @@ type IndexProgress struct {
 type Registry struct {
 	mu            sync.RWMutex
 	collections   map[string]CollectionMetric // key: job\x00db\x00coll
+	counts        map[string]collCounts       // key: job\x00db\x00coll (live count reconciliation)
 	jobs          map[string]*Job
 	indexProgress map[string]IndexProgress // key: job
 	ready         bool
@@ -91,6 +113,7 @@ type Registry struct {
 func NewRegistry() *Registry {
 	return &Registry{
 		collections:   make(map[string]CollectionMetric),
+		counts:        make(map[string]collCounts),
 		jobs:          make(map[string]*Job),
 		indexProgress: make(map[string]IndexProgress),
 		now:           time.Now,
@@ -109,12 +132,29 @@ func (r *Registry) SetCollection(m CollectionMetric) {
 	r.collections[collKey(m.Job, m.Database, m.Collection)] = m
 }
 
-// Collections returns all collection metrics, sorted for stable output.
+// SetCollectionCounts records the latest source/target document counts for a
+// collection, merged into its metric on read. Stored in a side map so the fast
+// live poller's SetCollection (which replaces the whole metric every 2s) does not
+// wipe these slow-cadence counts. No-op for a job/db/coll that never appears.
+func (r *Registry) SetCollectionCounts(job, db, coll string, source, target int64) {
+	r.mu.Lock()
+	r.counts[collKey(job, db, coll)] = collCounts{source: source, target: target, known: true, at: r.now()}
+	r.mu.Unlock()
+}
+
+// Collections returns all collection metrics, sorted for stable output. Any
+// recorded source/target counts are merged into each metric here.
 func (r *Registry) Collections() []CollectionMetric {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]CollectionMetric, 0, len(r.collections))
-	for _, m := range r.collections {
+	for k, m := range r.collections {
+		if c, ok := r.counts[k]; ok && c.known {
+			m.SourceCount = c.source
+			m.TargetCount = c.target
+			m.CountDiff = c.source - c.target
+			m.CountsKnown = true
+		}
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -210,6 +250,7 @@ func (r *Registry) PurgeInactive() int {
 	for k, m := range r.collections {
 		if dead[m.Job] {
 			delete(r.collections, k)
+			delete(r.counts, k)
 		}
 	}
 	for id := range r.indexProgress {
